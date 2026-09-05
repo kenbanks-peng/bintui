@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 
@@ -125,6 +125,115 @@ fn bintui_configuration_mutations_commit_and_push_only_the_changed_file() {
     assert!(
         git(&config_home, &["show", "origin/main:bintui/ignore.toml"])
             .contains(ignored.to_str().unwrap())
+    );
+}
+
+#[test]
+fn config_home_inside_a_git_worktree_is_committed_and_pushed() {
+    let temp = TempDir::new().unwrap();
+    let worktree = temp.path().join("home");
+    let config_home = worktree.join(".config");
+    let remote = temp.path().join("remote.git");
+    fs::create_dir_all(&config_home).unwrap();
+    fs::write(worktree.join("README"), "initial\n").unwrap();
+
+    git(&worktree, &["init", "-b", "main"]);
+    git(&worktree, &["config", "user.name", "Bin TUI Test"]);
+    git(&worktree, &["config", "user.email", "bin-tui@example.test"]);
+    git(&worktree, &["add", "README"]);
+    git(&worktree, &["commit", "-m", "Initial configuration"]);
+    let output = Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    git(
+        &worktree,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&worktree, &["push", "-u", "origin", "main"]);
+
+    let environment = environment(&worktree, &config_home);
+    let target = temp.path().join("project/tool");
+    executable(&target);
+    add(
+        AddRequest {
+            target,
+            name: Some("tool".to_owned()),
+            disabled: true,
+        },
+        &environment,
+    )
+    .unwrap();
+
+    assert_eq!(
+        git(&worktree, &["log", "-1", "--format=%s"]).trim(),
+        "Update bintui configuration"
+    );
+    assert_eq!(
+        git(&worktree, &["rev-parse", "HEAD"]).trim(),
+        git(&worktree, &["rev-parse", "origin/main"]).trim()
+    );
+    assert!(git(
+        &worktree,
+        &["show", "origin/main:.config/bintui/registry.toml"]
+    )
+    .contains("name = \"tool\""));
+}
+
+#[test]
+fn symlinked_bintui_directory_uses_the_physical_git_worktree() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let config_home = home.join(".config");
+    let worktree = temp.path().join("dotfiles");
+    let remote = temp.path().join("remote.git");
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(worktree.join("bintui")).unwrap();
+    symlink(worktree.join("bintui"), config_home.join("bintui")).unwrap();
+    fs::write(worktree.join("README"), "initial\n").unwrap();
+
+    git(&worktree, &["init", "-b", "main"]);
+    git(&worktree, &["config", "user.name", "Bin TUI Test"]);
+    git(&worktree, &["config", "user.email", "bin-tui@example.test"]);
+    git(&worktree, &["add", "README"]);
+    git(&worktree, &["commit", "-m", "Initial configuration"]);
+    let output = Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    git(
+        &worktree,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&worktree, &["push", "-u", "origin", "main"]);
+
+    let environment = environment(&home, &config_home);
+    let target = temp.path().join("project/tool");
+    executable(&target);
+    add(
+        AddRequest {
+            target,
+            name: Some("tool".to_owned()),
+            disabled: true,
+        },
+        &environment,
+    )
+    .unwrap();
+
+    assert_eq!(
+        git(&worktree, &["log", "-1", "--format=%s"]).trim(),
+        "Update bintui configuration"
+    );
+    assert_eq!(
+        git(&worktree, &["rev-parse", "HEAD"]).trim(),
+        git(&worktree, &["rev-parse", "origin/main"]).trim()
+    );
+    assert!(
+        git(&worktree, &["show", "origin/main:bintui/registry.toml"]).contains("name = \"tool\"")
     );
 }
 

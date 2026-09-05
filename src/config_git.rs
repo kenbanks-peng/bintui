@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -13,6 +14,11 @@ pub enum ConfigGitError {
     OutsideConfigHome { path: PathBuf, config_home: PathBuf },
     #[error("configuration change path is not valid UTF-8: {0}")]
     NonUtf8Path(PathBuf),
+    #[error("could not resolve configuration change {path}: {source}")]
+    Resolve {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("could not run git while {action} in {config_home}: {source}")]
     Execute {
         action: &'static str,
@@ -47,27 +53,37 @@ pub(crate) fn commit_and_push_in(
     changed_path: &Path,
     config_home: &Path,
 ) -> Result<(), ConfigGitError> {
-    if !config_home.join(".git").exists() {
+    changed_path
+        .strip_prefix(config_home)
+        .map_err(|_| ConfigGitError::OutsideConfigHome {
+            path: changed_path.to_path_buf(),
+            config_home: config_home.to_path_buf(),
+        })?;
+    let physical_path =
+        fs::canonicalize(changed_path).map_err(|source| ConfigGitError::Resolve {
+            path: changed_path.to_path_buf(),
+            source,
+        })?;
+    let Some(repository) = physical_path
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+    else {
         return Ok(());
-    }
-    let relative =
-        changed_path
-            .strip_prefix(config_home)
-            .map_err(|_| ConfigGitError::OutsideConfigHome {
-                path: changed_path.to_path_buf(),
-                config_home: config_home.to_path_buf(),
-            })?;
+    };
+    let relative = physical_path
+        .strip_prefix(repository)
+        .expect("resolved configuration path is inside its Git worktree");
     let relative = relative
         .to_str()
         .ok_or_else(|| ConfigGitError::NonUtf8Path(relative.to_path_buf()))?;
 
     run_git(
-        config_home,
+        repository,
         "staging the bintui change",
         &["add", "--", relative],
     )?;
     let diff = git_output(
-        config_home,
+        repository,
         "checking the staged bintui change",
         &["diff", "--cached", "--quiet", "--", relative],
     )?;
@@ -77,17 +93,17 @@ pub(crate) fn commit_and_push_in(
         _ => {
             return Err(command_failure(
                 "checking the staged bintui change",
-                config_home,
+                repository,
                 &diff,
             ))
         }
     }
     run_git(
-        config_home,
+        repository,
         "committing the bintui change",
         &["commit", "--only", "-m", COMMIT_MESSAGE, "--", relative],
     )?;
-    run_git(config_home, "pushing the bintui change", &["push"])?;
+    run_git(repository, "pushing the bintui change", &["push"])?;
     Ok(())
 }
 
