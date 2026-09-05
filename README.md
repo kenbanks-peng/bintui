@@ -10,7 +10,7 @@ Install from this checkout with Rust 1.74 or newer:
 cargo install --path . --locked
 ```
 
-Make sure both Cargo’s binary directory and the directory managed by `bin` are on your `PATH`:
+Make sure both Cargo’s binary directory and the directory managed by `bin` are on your `PATH`, for example:
 
 ```sh
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
@@ -23,3 +23,30 @@ bin
 ```
 
 Run `bin --help` to see the non-interactive commands for searching, adding, listing, enabling, disabling, renaming, and removing registrations.
+
+## Configuration
+
+`bin` reads `$XDG_CONFIG_HOME/bintui/config.toml`, falling back to `~/.config/bintui/config.toml`. The file is optional; without it, managed links are written to `$XDG_BIN_HOME` or `~/.local/bin` when `XDG_BIN_HOME` is unset.
+
+Example ~/.config/bintui/config.toml
+
+```toml
+version = 1
+bin_dir = "~/.local/bin"
+ignore = [
+  ".git",
+  "target/",
+  "**/node_modules/",
+]
+
+[roots]
+work = "~/Developer"
+tools = "$HOME/Tools"
+```
+
+- `version` must be `1`.
+- `bin_dir` override where managed links are published, taking precedence over `XDG_BIN_HOME`.
+- `ignore` contains gitignore-style patterns excluded during executable discovery.
+- `roots` as a convenience, assign short display names to absolute directory paths; paths beneath them are shortened, for example, `[work]/project/script`.
+
+Configured paths must resolve to absolute paths. They may start with `~/` and may reference environment variables as `$NAME` or `${NAME}`.
