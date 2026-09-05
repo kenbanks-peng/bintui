@@ -2,7 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Stdout};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEventKind, MouseButton, MouseEvent,
@@ -964,6 +968,7 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
         .roots;
     let mut session = TerminalSession::enter().map_err(|e| e.to_string())?;
     let mut controller = Controller::with_roots(root, environment.home().to_path_buf(), roots);
+    let mut worker = BackgroundRunner::new();
     if let Ok(diagnostic) = application::path_diagnostic(environment) {
         if diagnostic.status == PathStatus::Missing {
             controller.path_warning = Some(format!(
@@ -973,23 +978,121 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
         }
     }
     loop {
-        while let Some(request) = controller.take_request() {
-            let result = execute_request(request, environment);
+        if let Some(result) = worker.try_take()? {
             controller.complete(result);
+        }
+        if controller.should_exit() && !worker.is_active() {
+            return Ok(());
+        }
+        if !controller.should_exit() && !worker.is_active() {
+            if let Some(request) = controller.take_request() {
+                let environment = environment.clone();
+                worker.start(move || execute_request(request, &environment))?;
+            }
         }
         session
             .terminal
             .draw(|frame| render(frame, &mut controller))
             .map_err(|e| e.to_string())?;
-        if controller.should_exit() {
-            return Ok(());
+        if event::poll(Duration::from_millis(50)).map_err(|e| e.to_string())? {
+            let event = event::read().map_err(|e| e.to_string())?;
+            if let Some(event) =
+                translate_event(event, controller.dialog.is_some(), controller.filter_active)
+            {
+                controller.handle(event);
+            }
         }
-        let event = event::read().map_err(|e| e.to_string())?;
-        if let Some(event) =
-            translate_event(event, controller.dialog.is_some(), controller.filter_active)
-        {
-            controller.handle(event);
+    }
+}
+
+struct BackgroundRunner<T> {
+    sender: Sender<Result<T, String>>,
+    receiver: Receiver<Result<T, String>>,
+    active: bool,
+}
+
+impl<T: Send + 'static> BackgroundRunner<T> {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver,
+            active: false,
         }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn start(&mut self, task: impl FnOnce() -> T + Send + 'static) -> Result<(), String> {
+        debug_assert!(!self.active);
+        self.active = true;
+        let sender = self.sender.clone();
+        thread::Builder::new()
+            .name("bintui-operation".to_owned())
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(task))
+                    .map_err(|_| "background operation panicked".to_owned());
+                let _ = sender.send(result);
+            })
+            .map(|_| ())
+            .map_err(|error| {
+                self.active = false;
+                format!("could not start background operation: {error}")
+            })
+    }
+
+    fn try_take(&mut self) -> Result<Option<T>, String> {
+        match self.receiver.try_recv() {
+            Ok(result) => {
+                self.active = false;
+                result.map(Some)
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.active = false;
+                Err("background operation ended without a result".to_owned())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod background_runner_tests {
+    use super::BackgroundRunner;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn task_runs_without_blocking_the_calling_thread() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut runner = BackgroundRunner::new();
+
+        runner
+            .start(move || {
+                started_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                "complete"
+            })
+            .unwrap();
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(runner.is_active());
+        assert!(runner.try_take().unwrap().is_none());
+        release_sender.send(()).unwrap();
+        let result = loop {
+            if let Some(result) = runner.try_take().unwrap() {
+                break result;
+            }
+            thread::yield_now();
+        };
+        assert_eq!(result, "complete");
+        assert!(!runner.is_active());
     }
 }
 
