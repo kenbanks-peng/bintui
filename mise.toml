@@ -1,0 +1,11 @@
+[env]
+BINDIR = "{{ env.XDG_BIN_HOME | default(value=env.HOME ~ '/.local/bin') }}"
+
+[tasks.build]
+description = "Build production release"
+run = "cargo build --release"
+
+[tasks.deploy]
+description = "Deploy the release binary to $BINDIR"
+depends = ["build"]
+run = "mkdir -p \"$BINDIR\" && install -m 755 target/release/bin \"$BINDIR/bin\""
