@@ -5,9 +5,12 @@ use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-use bintui::application::{add, ignore_target, AddRequest};
-use bintui::config_git;
+use bintui::application::{add, ignore_target, AddRequest, Application};
+use bintui::config_git::{self, BackgroundGitSync};
 use bintui::environment::Environment;
 use tempfile::TempDir;
 
@@ -234,6 +237,110 @@ fn symlinked_bintui_directory_uses_the_physical_git_worktree() {
     );
     assert!(
         git(&worktree, &["show", "origin/main:bintui/registry.toml"]).contains("name = \"tool\"")
+    );
+}
+
+#[test]
+fn queued_git_sync_does_not_delay_a_toggle_result() {
+    let temp = TempDir::new().unwrap();
+    let config_home = temp.path().join("config");
+    let remote = temp.path().join("remote.git");
+    fs::create_dir_all(&config_home).unwrap();
+    git(&config_home, &["init", "-b", "main"]);
+    git(&config_home, &["config", "user.name", "Bin TUI Test"]);
+    git(
+        &config_home,
+        &["config", "user.email", "bin-tui@example.test"],
+    );
+    let output = Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    git(
+        &config_home,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    fs::write(config_home.join("README"), "initial\n").unwrap();
+    git(&config_home, &["add", "README"]);
+    git(&config_home, &["commit", "-m", "Initial configuration"]);
+    git(&config_home, &["push", "-u", "origin", "main"]);
+
+    let environment = environment(temp.path(), &config_home);
+    let target = temp.path().join("project/tool");
+    executable(&target);
+    add(
+        AddRequest {
+            target,
+            name: Some("tool".to_owned()),
+            disabled: false,
+        },
+        &environment,
+    )
+    .unwrap();
+
+    let started = temp.path().join("push-started");
+    let release = temp.path().join("release-push");
+    git(&config_home, &["config", "core.hooksPath", ".git/hooks"]);
+    let hook = config_home.join(".git/hooks/pre-push");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntouch {:?}\nwhile [ ! -e {:?} ]; do sleep 0.01; done\n",
+            started, release
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let background = BackgroundGitSync::start();
+    let policy = background.policy();
+    let worker_environment = environment.clone();
+    let (result_sender, result_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = Application::with_git_sync(&worker_environment, policy).disable("tool");
+        result_sender.send(result).unwrap();
+    });
+
+    let toggle_result = result_receiver.recv_timeout(Duration::from_secs(1));
+    if toggle_result.is_err() {
+        fs::write(&release, "release\n").unwrap();
+        let _ = background.finish();
+        panic!("toggle result waited for the blocked Git push");
+    }
+    assert!(
+        !toggle_result
+            .unwrap()
+            .unwrap()
+            .registration
+            .unwrap()
+            .registration
+            .enabled
+    );
+    for _ in 0..100 {
+        if started.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !started.exists() {
+        let sync_result = background.try_take();
+        fs::write(&release, "release\n").unwrap();
+        let remaining = background.finish();
+        panic!(
+            "pre-push hook did not start; early result: {sync_result:?}; remaining: {remaining:?}"
+        );
+    }
+    assert!(
+        git(&config_home, &["show", "origin/main:bintui/registry.toml"]).contains("enabled = true")
+    );
+
+    fs::write(release, "release\n").unwrap();
+    assert!(background.finish().into_iter().all(|result| result.is_ok()));
+    assert!(
+        git(&config_home, &["show", "origin/main:bintui/registry.toml"])
+            .contains("enabled = false")
     );
 }
 

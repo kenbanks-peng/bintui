@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::config_git::ConfigGitSync;
 use crate::configuration::{self, normalize, ConfigurationError};
 use crate::discovery;
 use crate::discovery_ignore::{self, DiscoveryIgnoreError};
@@ -42,6 +43,7 @@ pub struct AddRequest {
 pub struct Application<'a> {
     environment: &'a Environment,
     faults: &'a dyn MutationFaultInjector,
+    git_sync: ConfigGitSync,
 }
 
 impl<'a> Application<'a> {
@@ -49,6 +51,15 @@ impl<'a> Application<'a> {
         Self {
             environment,
             faults: &NoMutationFaults,
+            git_sync: ConfigGitSync::blocking(),
+        }
+    }
+
+    pub fn with_git_sync(environment: &'a Environment, git_sync: ConfigGitSync) -> Self {
+        Self {
+            environment,
+            faults: &NoMutationFaults,
+            git_sync,
         }
     }
 
@@ -59,6 +70,7 @@ impl<'a> Application<'a> {
         Self {
             environment,
             faults,
+            git_sync: ConfigGitSync::blocking(),
         }
     }
 
@@ -74,7 +86,7 @@ impl<'a> Application<'a> {
                 .and_then(|name| name.to_str())
                 .map(str::to_owned)
         });
-        add_with_faults(request, self.environment, self.faults).map_err(|error| {
+        add_with_faults(request, self.environment, self.faults, &self.git_sync).map_err(|error| {
             mutation_error(
                 "add-failed",
                 error,
@@ -85,23 +97,33 @@ impl<'a> Application<'a> {
     }
 
     pub fn enable(&self, name: &str) -> Result<LifecycleResult, ApplicationError> {
-        set_enabled(name, true, self.environment, self.faults)
+        set_enabled(name, true, self.environment, self.faults, &self.git_sync)
             .map_err(|error| mutation_error("enable-failed", error, Some(name), self.environment))
     }
 
     pub fn disable(&self, name: &str) -> Result<LifecycleResult, ApplicationError> {
-        set_enabled(name, false, self.environment, self.faults)
+        set_enabled(name, false, self.environment, self.faults, &self.git_sync)
             .map_err(|error| mutation_error("disable-failed", error, Some(name), self.environment))
     }
 
     pub fn remove(&self, name: &str) -> Result<LifecycleResult, ApplicationError> {
-        remove_with_faults(name, self.environment, self.faults)
+        remove_with_faults(name, self.environment, self.faults, &self.git_sync)
             .map_err(|error| mutation_error("remove-failed", error, Some(name), self.environment))
     }
 
     pub fn rename(&self, name: &str, new_name: &str) -> Result<LifecycleResult, ApplicationError> {
-        rename_with_faults(name, new_name, self.environment, self.faults)
-            .map_err(|error| rename_error(error, name, new_name, self.environment))
+        rename_with_faults(
+            name,
+            new_name,
+            self.environment,
+            self.faults,
+            &self.git_sync,
+        )
+        .map_err(|error| rename_error(error, name, new_name, self.environment))
+    }
+
+    pub fn ignore_target(&self, target: &Path) -> Result<String, ApplicationError> {
+        ignore_target_with_git_sync(target, self.environment, &self.git_sync)
     }
 
     pub fn path_diagnostic(&self) -> Result<PathDiagnostic, ApplicationError> {
@@ -353,6 +375,7 @@ fn set_enabled(
     enabled: bool,
     environment: &Environment,
     faults: &dyn MutationFaultInjector,
+    git_sync: &ConfigGitSync,
 ) -> Result<LifecycleResult, ApplicationError> {
     registry::validate_name(name).map_err(ApplicationError::InvalidInput)?;
     let configuration = configuration::load(environment)?;
@@ -413,7 +436,7 @@ fn set_enabled(
         .position(|registration| registration.name == name)
         .expect("locked Registry still contains Registration");
     registrations[position] = updated.clone();
-    if let Err(error) = registry.replace(registrations, faults) {
+    if let Err(error) = registry.replace(registrations, faults, git_sync, environment) {
         if !error.replacement_committed() {
             if enabled {
                 let _ = remove_owned_link(&managed_link, &existing.target, &NoMutationFaults);
@@ -442,6 +465,7 @@ fn remove_with_faults(
     name: &str,
     environment: &Environment,
     faults: &dyn MutationFaultInjector,
+    git_sync: &ConfigGitSync,
 ) -> Result<LifecycleResult, ApplicationError> {
     registry::validate_name(name).map_err(ApplicationError::InvalidInput)?;
     let configuration = configuration::load(environment)?;
@@ -467,7 +491,7 @@ fn remove_with_faults(
         .filter(|registration| registration.name != name)
         .cloned()
         .collect();
-    if let Err(error) = registry.replace(registrations, faults) {
+    if let Err(error) = registry.replace(registrations, faults, git_sync, environment) {
         if !error.replacement_committed() && owned && fs::symlink_metadata(&managed_link).is_err() {
             let _ = symlink(&existing.target, &managed_link);
         }
@@ -613,6 +637,7 @@ fn add_with_faults(
     request: AddRequest,
     environment: &Environment,
     faults: &dyn MutationFaultInjector,
+    git_sync: &ConfigGitSync,
 ) -> Result<LifecycleResult, ApplicationError> {
     let prepared = prepare_add(request, environment)?;
     let mut registry = LockedRegistry::acquire(environment, faults)?;
@@ -649,7 +674,7 @@ fn add_with_faults(
     let mut registrations = registry.registrations().to_vec();
     registrations.push(registration.clone());
     registrations.sort_by(|left, right| left.name.cmp(&right.name));
-    if let Err(error) = registry.replace(registrations, faults) {
+    if let Err(error) = registry.replace(registrations, faults, git_sync, environment) {
         if !error.replacement_committed() && registration.enabled {
             let _ = remove_owned_link(&managed_link, &registration.target, &NoMutationFaults);
         }
@@ -869,6 +894,7 @@ fn rename_with_faults(
     new_name: &str,
     environment: &Environment,
     faults: &dyn MutationFaultInjector,
+    git_sync: &ConfigGitSync,
 ) -> Result<LifecycleResult, ApplicationError> {
     registry::validate_name(name).map_err(ApplicationError::InvalidInput)?;
     registry::validate_name(new_name).map_err(ApplicationError::InvalidInput)?;
@@ -972,7 +998,7 @@ fn rename_with_faults(
         .expect("locked Registry still contains Registration");
     registrations[position] = updated.clone();
     registrations.sort_by(|left, right| left.name.cmp(&right.name));
-    if let Err(error) = registry.replace(registrations, faults) {
+    if let Err(error) = registry.replace(registrations, faults, git_sync, environment) {
         if !error.replacement_committed() {
             if existing.enabled {
                 let _ = remove_owned_link(&new_link, &existing.target, &NoMutationFaults);
@@ -1029,11 +1055,21 @@ pub fn path_diagnostic(environment: &Environment) -> Result<PathDiagnostic, Appl
 }
 
 pub fn ignore_target(target: &Path, environment: &Environment) -> Result<String, ApplicationError> {
+    ignore_target_with_git_sync(target, environment, &ConfigGitSync::blocking())
+}
+
+fn ignore_target_with_git_sync(
+    target: &Path,
+    environment: &Environment,
+    git_sync: &ConfigGitSync,
+) -> Result<String, ApplicationError> {
     let target = absolute_target(target, environment);
-    discovery_ignore::add(&target, environment).map_err(|error| ApplicationError::Operation {
-        identifier: "ignore-failed",
-        message: error.to_string(),
-        resulting_registration: None,
+    discovery_ignore::add_with_git_sync(&target, environment, git_sync).map_err(|error| {
+        ApplicationError::Operation {
+            identifier: "ignore-failed",
+            message: error.to_string(),
+            resulting_registration: None,
+        }
     })?;
     Ok("target-ignored".to_owned())
 }

@@ -8,7 +8,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config_git::{self, ConfigGitError};
+use crate::config_git::{ConfigGitError, ConfigGitSync};
 use crate::configuration::normalize;
 use crate::environment::Environment;
 
@@ -72,6 +72,14 @@ pub fn load(environment: &Environment) -> Result<BTreeSet<PathBuf>, DiscoveryIgn
 }
 
 pub fn add(target: &Path, environment: &Environment) -> Result<(), DiscoveryIgnoreError> {
+    add_with_git_sync(target, environment, &ConfigGitSync::blocking())
+}
+
+pub(crate) fn add_with_git_sync(
+    target: &Path,
+    environment: &Environment,
+    git_sync: &ConfigGitSync,
+) -> Result<(), DiscoveryIgnoreError> {
     let target = normalize(target);
     if !target.is_absolute() {
         return Err(DiscoveryIgnoreError::Invalid {
@@ -114,7 +122,7 @@ pub fn add(target: &Path, environment: &Environment) -> Result<(), DiscoveryIgno
     let mut paths = load_path(&ignore_path)?;
     paths.insert(target);
     write_atomic(&ignore_path, &paths)?;
-    config_git::commit_and_push(&ignore_path, environment)?;
+    git_sync.synchronize(&ignore_path, environment)?;
     Ok(())
 }
 

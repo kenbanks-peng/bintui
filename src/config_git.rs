@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 
 use thiserror::Error;
 
@@ -31,9 +33,103 @@ pub enum ConfigGitError {
         config_home: PathBuf,
         message: String,
     },
+    #[error("background Git synchronization is unavailable")]
+    QueueUnavailable,
 }
 
-/// Commits and pushes one file changed by bintui when XDG_CONFIG_HOME is itself a Git worktree.
+#[derive(Clone)]
+pub struct ConfigGitSync {
+    destination: SyncDestination,
+}
+
+#[derive(Clone)]
+enum SyncDestination {
+    Blocking,
+    Background(Sender<SyncJob>),
+}
+
+struct SyncJob {
+    changed_path: PathBuf,
+    environment: Environment,
+}
+
+impl ConfigGitSync {
+    pub fn blocking() -> Self {
+        Self {
+            destination: SyncDestination::Blocking,
+        }
+    }
+
+    pub fn synchronize(
+        &self,
+        changed_path: &Path,
+        environment: &Environment,
+    ) -> Result<(), ConfigGitError> {
+        match &self.destination {
+            SyncDestination::Blocking => commit_and_push(changed_path, environment),
+            SyncDestination::Background(sender) => sender
+                .send(SyncJob {
+                    changed_path: changed_path.to_path_buf(),
+                    environment: environment.clone(),
+                })
+                .map_err(|_| ConfigGitError::QueueUnavailable),
+        }
+    }
+}
+
+pub struct BackgroundGitSync {
+    sender: Option<Sender<SyncJob>>,
+    results: Receiver<Result<(), ConfigGitError>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl BackgroundGitSync {
+    pub fn start() -> Self {
+        let (sender, jobs) = mpsc::channel::<SyncJob>();
+        let (result_sender, results) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("bintui-git-sync".to_owned())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let result = commit_and_push(&job.changed_path, &job.environment);
+                    if result_sender.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("could not start background Git synchronization");
+        Self {
+            sender: Some(sender),
+            results,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn policy(&self) -> ConfigGitSync {
+        ConfigGitSync {
+            destination: SyncDestination::Background(
+                self.sender
+                    .as_ref()
+                    .expect("background Git synchronization is active")
+                    .clone(),
+            ),
+        }
+    }
+
+    pub fn try_take(&self) -> Option<Result<(), ConfigGitError>> {
+        self.results.try_recv().ok()
+    }
+
+    pub fn finish(mut self) -> Vec<Result<(), ConfigGitError>> {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.results.try_iter().collect()
+    }
+}
+
+/// Commits and pushes one file changed by bintui when it resolves inside a Git worktree.
 /// Other staged or unstaged files are left out of the commit.
 pub fn commit_and_push(
     changed_path: &Path,

@@ -25,6 +25,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 
 use crate::application::{self, AddRequest, ApplicationError, SearchRequest};
+use crate::config_git::{BackgroundGitSync, ConfigGitSync};
 use crate::environment::Environment;
 use crate::model::{
     Candidate, LifecycleResult, ListResult, ManagedPathKind, PathStatus, RegistrationState,
@@ -969,6 +970,7 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
     let mut session = TerminalSession::enter().map_err(|e| e.to_string())?;
     let mut controller = Controller::with_roots(root, environment.home().to_path_buf(), roots);
     let mut worker = BackgroundRunner::new();
+    let git_sync = BackgroundGitSync::start();
     if let Ok(diagnostic) = application::path_diagnostic(environment) {
         if diagnostic.status == PathStatus::Missing {
             controller.path_warning = Some(format!(
@@ -981,13 +983,22 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
         if let Some(result) = worker.try_take()? {
             controller.complete(result);
         }
+        while let Some(result) = git_sync.try_take() {
+            if let Err(error) = result {
+                controller.dialog = Some(Dialog::Error {
+                    text: format!("git-sync-failed: {error}"),
+                });
+            }
+        }
         if controller.should_exit() && !worker.is_active() {
-            return Ok(());
+            let pending_error = git_sync.finish().into_iter().find_map(Result::err);
+            return pending_error.map_or(Ok(()), |error| Err(error.to_string()));
         }
         if !controller.should_exit() && !worker.is_active() {
             if let Some(request) = controller.take_request() {
                 let environment = environment.clone();
-                worker.start(move || execute_request(request, &environment))?;
+                let git_sync = git_sync.policy();
+                worker.start(move || execute_request(request, &environment, &git_sync))?;
             }
         }
         session
@@ -1096,7 +1107,12 @@ mod background_runner_tests {
     }
 }
 
-fn execute_request(request: Request, environment: &Environment) -> OperationResult {
+fn execute_request(
+    request: Request,
+    environment: &Environment,
+    git_sync: &ConfigGitSync,
+) -> OperationResult {
+    let application = application::Application::with_git_sync(environment, git_sync.clone());
     match request {
         Request::Search(search_root) => OperationResult::Search(
             application::search(
@@ -1119,23 +1135,18 @@ fn execute_request(request: Request, environment: &Environment) -> OperationResu
             )
             .map_err(Into::into),
         ),
-        Request::Add { target, name } => mutation_result(application::add(
-            AddRequest {
-                target,
-                name: Some(name),
-                disabled: false,
-            },
-            environment,
-        )),
-        Request::Remove(name) => mutation_result(application::remove(&name, environment)),
-        Request::Enable(name) => mutation_result(application::enable(&name, environment)),
-        Request::Disable(name) => mutation_result(application::disable(&name, environment)),
-        Request::Rename { name, new_name } => {
-            mutation_result(application::rename(&name, &new_name, environment))
+        Request::Add { target, name } => mutation_result(application.add(AddRequest {
+            target,
+            name: Some(name),
+            disabled: false,
+        })),
+        Request::Remove(name) => mutation_result(application.remove(&name)),
+        Request::Enable(name) => mutation_result(application.enable(&name)),
+        Request::Disable(name) => mutation_result(application.disable(&name)),
+        Request::Rename { name, new_name } => mutation_result(application.rename(&name, &new_name)),
+        Request::Ignore(target) => {
+            OperationResult::Ignore(application.ignore_target(&target).map_err(Into::into))
         }
-        Request::Ignore(target) => OperationResult::Ignore(
-            application::ignore_target(&target, environment).map_err(Into::into),
-        ),
     }
 }
 
