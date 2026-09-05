@@ -13,6 +13,16 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 #[test]
+fn version_flag_prints_package_version_without_tui() {
+    Command::cargo_bin("bin")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(format!("bin {}\n", env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn help_subcommand_lists_commands_without_tui() {
     Command::cargo_bin("bin")
         .unwrap()

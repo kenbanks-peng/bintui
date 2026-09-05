@@ -17,6 +17,7 @@ use crate::model::{
 #[derive(Parser)]
 #[command(
     name = "bin",
+    version,
     about = "Publish local targets under stable Command Names"
 )]
 struct Arguments {
