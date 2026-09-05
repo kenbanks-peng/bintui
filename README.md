@@ -1,6 +1,6 @@
 # bin
 
-`bin` is a macOS terminal UI for finding executable files in local projects and publishing them under stable command names. It manages those names as symbolic links in `$XDG_BIN_HOME` or `~/.local/bin`.
+`bin` is a macOS terminal TUI for any dev who has lots of scattered executables and scripts, and would like a quick way to find them and have them in your path via a common bin folder.
 
 ## Install
 
