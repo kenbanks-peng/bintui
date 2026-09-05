@@ -8,6 +8,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::config_git::{self, ConfigGitError};
 use crate::configuration::normalize;
 use crate::environment::Environment;
 
@@ -40,6 +41,8 @@ pub enum DiscoveryIgnoreError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("discovery ignore file was replaced but its Git synchronization failed: {0}")]
+    GitSync(#[from] ConfigGitError),
 }
 
 #[derive(Deserialize)]
@@ -110,7 +113,9 @@ pub fn add(target: &Path, environment: &Environment) -> Result<(), DiscoveryIgno
 
     let mut paths = load_path(&ignore_path)?;
     paths.insert(target);
-    write_atomic(&ignore_path, &paths)
+    write_atomic(&ignore_path, &paths)?;
+    config_git::commit_and_push(&ignore_path, environment)?;
+    Ok(())
 }
 
 fn load_path(path: &Path) -> Result<BTreeSet<PathBuf>, DiscoveryIgnoreError> {

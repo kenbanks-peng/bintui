@@ -1,5 +1,6 @@
 pub mod application;
 pub mod cli;
+pub mod config_git;
 pub mod configuration;
 pub mod discovery;
 pub mod discovery_ignore;

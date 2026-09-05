@@ -50,3 +50,5 @@ tools = "$HOME/Tools"
 - `roots` as a convenience, assign short display names to absolute directory paths; paths beneath them are shortened, for example, `[work]/project/script`.
 
 Configured paths must resolve to absolute paths. They may start with `~/` and may reference environment variables as `$NAME` or `${NAME}`.
+
+When `$XDG_CONFIG_HOME` (or the `~/.config` fallback) is itself a Git worktree, every registry, discovery-ignore, or configuration file change made by `bin` is committed as `Update bintui configuration` and pushed to the current branch's configured upstream. Only the file changed by `bin` is included; other staged or unstaged changes are left alone. A commit or push failure is reported as an operation failure after the local configuration change has been written.

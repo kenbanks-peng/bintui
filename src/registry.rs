@@ -9,6 +9,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::config_git::{self, ConfigGitError};
 use crate::configuration::{expand_path, normalize};
 use crate::environment::Environment;
 use crate::model::{MutationBoundary, MutationFaultInjector, Registration};
@@ -52,12 +53,14 @@ pub enum RegistryError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("Registry was replaced but its Git synchronization failed: {0}")]
+    GitSync(#[from] ConfigGitError),
 }
 
 impl RegistryError {
     /// True when the atomic replacement already committed the new desired state.
     pub fn replacement_committed(&self) -> bool {
-        matches!(self, Self::Durability { .. })
+        matches!(self, Self::Durability { .. } | Self::GitSync(_))
     }
 }
 
@@ -94,6 +97,7 @@ struct StoredRegistration<'a> {
 pub struct LockedRegistry {
     path: PathBuf,
     home: PathBuf,
+    config_home: PathBuf,
     _lock: File,
     registrations: Vec<Registration>,
 }
@@ -135,6 +139,7 @@ impl LockedRegistry {
         Ok(Self {
             path,
             home: environment.home().to_path_buf(),
+            config_home: config_git::config_home(environment),
             _lock: lock,
             registrations,
         })
@@ -151,6 +156,7 @@ impl LockedRegistry {
     ) -> Result<(), RegistryError> {
         write_atomic(&self.path, &self.home, &registrations, faults)?;
         self.registrations = registrations;
+        config_git::commit_and_push_in(&self.path, &self.config_home)?;
         Ok(())
     }
 }
