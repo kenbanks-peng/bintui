@@ -288,6 +288,7 @@ pub struct Controller {
     dialog: Option<Dialog>,
     pending: Option<Request>,
     mutation_active: bool,
+    preserve_registration_order: bool,
     pending_add: Option<(PathBuf, String)>,
     active_add_target: Option<PathBuf>,
     session_registered_targets: BTreeSet<PathBuf>,
@@ -328,6 +329,7 @@ impl Controller {
             registrations: ItemList::default(),
             dialog: None,
             mutation_active: false,
+            preserve_registration_order: false,
             pending_add: None,
             active_add_target: None,
             session_registered_targets: BTreeSet::new(),
@@ -422,8 +424,23 @@ impl Controller {
                 });
             }
             OperationResult::List(Ok(mut result)) => {
+                let previous_order: BTreeMap<_, _> = if self.preserve_registration_order {
+                    self.registrations
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| (entry.name.clone(), index))
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                };
+                self.preserve_registration_order = false;
                 result.registrations.sort_by_cached_key(|registration| {
                     (
+                        previous_order
+                            .get(&registration.registration.name)
+                            .copied()
+                            .unwrap_or(usize::MAX),
                         registration.defect.is_none(),
                         registration_root_sort_key(
                             &registration.registration.target,
@@ -504,6 +521,7 @@ impl Controller {
             }
         }
         self.active_item_key = None;
+        self.preserve_registration_order = self.view == View::Registrations;
         self.pending = Some(self.reload_request());
     }
 
@@ -529,6 +547,7 @@ impl Controller {
             Event::Up => self.move_focus(-1),
             Event::Down => self.move_focus(1),
             Event::SwitchView => {
+                self.preserve_registration_order = false;
                 self.view = match self.view {
                     View::Discover => View::Registrations,
                     View::Registrations => View::Discover,
@@ -584,6 +603,7 @@ impl Controller {
                 if contains(self.mouse_regions.tabs[index], column, row) {
                     self.filter_active = false;
                     if self.view != view {
+                        self.preserve_registration_order = false;
                         self.view = view;
                         self.pending = Some(self.reload_request());
                     }

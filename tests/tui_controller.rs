@@ -757,6 +757,85 @@ fn delete_disables_the_focused_enabled_registration() {
 }
 
 #[test]
+fn disabling_a_broken_registration_keeps_it_in_place_and_unchecked() {
+    let broken = registration_state(
+        "zulu",
+        "/project/zulu",
+        Some(RegistrationDefectKind::LinkBroken),
+    );
+    let healthy = registration_state("alpha", "/project/alpha", None);
+    let mut controller = registration_controller(broken.clone());
+    controller.complete(OperationResult::List(Ok(ListResult {
+        status: LifecycleStatus::Blocked,
+        identifier: "registrations-listed".to_owned(),
+        registrations: vec![healthy.clone(), broken.clone()],
+    })));
+    controller.handle(Event::Delete);
+    assert_eq!(
+        controller.take_request(),
+        Some(Request::Disable("zulu".to_owned()))
+    );
+    let mut disabled = broken;
+    disabled.registration.enabled = false;
+    disabled.actual = ManagedPathKind::Missing;
+    disabled.defect = None;
+    controller.complete(OperationResult::Mutation(Ok(
+        bintui::model::LifecycleResult {
+            status: LifecycleStatus::Healthy,
+            identifier: "registration-disabled".to_owned(),
+            registration: Some(disabled.clone()),
+            conflict: None,
+        },
+    )));
+    assert_eq!(controller.take_request(), Some(Request::List));
+    controller.complete(OperationResult::List(Ok(ListResult {
+        status: LifecycleStatus::Healthy,
+        identifier: "registrations-listed".to_owned(),
+        registrations: vec![healthy, disabled],
+    })));
+    let state = controller.semantic_state(80, 24);
+    assert_eq!(state.items.len(), 2);
+    assert_eq!(state.items[0].name, "zulu");
+    assert!(!state.items[0].checked);
+    controller.handle(Event::Delete);
+    assert_eq!(
+        controller.take_request(),
+        Some(Request::Remove("zulu".to_owned()))
+    );
+}
+
+#[test]
+fn reopening_registrations_restores_error_first_sort_order() {
+    let mut controller = registration_controller(registration_state("zulu", "/project/zulu", None));
+    controller.handle(Event::SwitchView);
+    controller.take_request();
+    controller.handle(Event::SwitchView);
+    assert_eq!(controller.take_request(), Some(Request::List));
+    controller.complete(OperationResult::List(Ok(ListResult {
+        status: LifecycleStatus::Blocked,
+        identifier: "registrations-listed".to_owned(),
+        registrations: vec![
+            registration_state("zulu", "/project/zulu", None),
+            registration_state("alpha", "/project/alpha", None),
+            registration_state(
+                "issue",
+                "/project/issue",
+                Some(RegistrationDefectKind::TargetMissing),
+            ),
+        ],
+    })));
+    let state = controller.semantic_state(80, 24);
+    assert_eq!(
+        state
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["issue", "alpha", "zulu"]
+    );
+}
+
+#[test]
 fn delete_unregisters_the_focused_disabled_registration_immediately() {
     let mut state = registration_state("alpha", "/project/alpha", None);
     state.registration.enabled = false;
