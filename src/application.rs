@@ -389,7 +389,18 @@ fn set_enabled(
     let managed_link = managed_link(&configuration.bin_dir, name)?;
     let path_exists = fs::symlink_metadata(&managed_link).is_ok();
     let owned = is_owned_link(&managed_link, &existing.target);
-    if path_exists && !owned {
+    // Disable may remove a dangling link even when its target has changed.
+    // Keep the observed target for removal revalidation and rollback.
+    let removable_target = if owned {
+        Some(existing.target.clone())
+    } else if !enabled
+        && matches!(fs::metadata(&managed_link), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        fs::read_link(&managed_link).ok()
+    } else {
+        None
+    };
+    if path_exists && removable_target.is_none() {
         return blocked(existing, &configuration.bin_dir, "managed-path-conflict");
     }
     if existing.enabled == enabled && ((enabled && owned) || (!enabled && !path_exists)) {
@@ -403,7 +414,9 @@ fn set_enabled(
             &configuration.bin_dir,
         );
     }
-    if enabled {
+    if enabled
+        && !matches!(fs::metadata(&existing.target), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
         validate_target(&existing.target)?;
     }
     if enabled && !owned {
@@ -425,8 +438,10 @@ fn set_enabled(
                 source,
             }
         })?;
-    } else if !enabled && owned {
-        remove_owned_link(&managed_link, &existing.target, faults)?;
+    } else if let Some(target) = &removable_target {
+        if !enabled {
+            remove_owned_link(&managed_link, target, faults)?;
+        }
     }
     let mut updated = existing.clone();
     updated.enabled = enabled;
@@ -440,8 +455,10 @@ fn set_enabled(
         if !error.replacement_committed() {
             if enabled {
                 let _ = remove_owned_link(&managed_link, &existing.target, &NoMutationFaults);
-            } else if !enabled && fs::symlink_metadata(&managed_link).is_err() {
-                let _ = symlink(&existing.target, &managed_link);
+            } else if let Some(target) = &removable_target {
+                if fs::symlink_metadata(&managed_link).is_err() {
+                    let _ = symlink(target, &managed_link);
+                }
             }
         }
         return Err(error.into());

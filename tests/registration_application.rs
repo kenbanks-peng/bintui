@@ -372,6 +372,137 @@ fn lifecycle_mutations_block_unmanaged_entries_and_changed_registered_links() {
 }
 
 #[test]
+fn disable_removes_a_broken_link_to_an_unexpected_target_and_allows_unregister() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join("project/tool");
+    executable(&target);
+    let environment = environment(temp.path());
+    let managed = add(
+        AddRequest {
+            target,
+            name: None,
+            disabled: false,
+        },
+        &environment,
+    )
+    .unwrap()
+    .registration
+    .unwrap()
+    .managed_link;
+    fs::remove_file(&managed).unwrap();
+    symlink(temp.path().join("missing/other"), &managed).unwrap();
+
+    let disabled = disable("tool", &environment).unwrap();
+    assert_eq!(disabled.identifier, "registration-disabled");
+    assert!(!disabled.registration.unwrap().registration.enabled);
+    assert!(fs::symlink_metadata(&managed).is_err());
+    assert!(
+        !list(&environment).unwrap().registrations[0]
+            .registration
+            .enabled
+    );
+
+    assert_eq!(
+        remove("tool", &environment).unwrap().identifier,
+        "registration-removed"
+    );
+    assert!(list(&environment).unwrap().registrations.is_empty());
+}
+
+#[test]
+fn missing_target_can_be_enabled_disabled_and_unregistered() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join("project/tool");
+    executable(&target);
+    let environment = environment(temp.path());
+    let managed = add(
+        AddRequest {
+            target: target.clone(),
+            name: None,
+            disabled: false,
+        },
+        &environment,
+    )
+    .unwrap()
+    .registration
+    .unwrap()
+    .managed_link;
+    fs::remove_file(&target).unwrap();
+
+    assert_eq!(
+        disable("tool", &environment).unwrap().identifier,
+        "registration-disabled"
+    );
+    assert!(fs::symlink_metadata(&managed).is_err());
+    let enabled = enable("tool", &environment).unwrap().registration.unwrap();
+    assert!(enabled.registration.enabled);
+    assert_eq!(
+        enabled.defect.unwrap().kind,
+        bintui::model::RegistrationDefectKind::TargetMissing
+    );
+    assert_eq!(fs::read_link(&managed).unwrap(), target);
+    assert_eq!(
+        disable("tool", &environment).unwrap().identifier,
+        "registration-disabled"
+    );
+    assert!(fs::symlink_metadata(&managed).is_err());
+    assert_eq!(
+        remove("tool", &environment).unwrap().identifier,
+        "registration-removed"
+    );
+}
+
+#[test]
+fn broken_link_disable_preserves_replacements_and_restores_original_link_on_failure() {
+    for boundary in [
+        MutationBoundary::ManagedLinkRemoval,
+        MutationBoundary::TemporaryRegistryWrite,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("project/tool");
+        executable(&target);
+        let environment = environment(temp.path());
+        let managed = add(
+            AddRequest {
+                target,
+                name: None,
+                disabled: false,
+            },
+            &environment,
+        )
+        .unwrap()
+        .registration
+        .unwrap()
+        .managed_link;
+        let unexpected = PathBuf::from("../../missing/other");
+        fs::remove_file(&managed).unwrap();
+        symlink(&unexpected, &managed).unwrap();
+
+        if boundary == MutationBoundary::ManagedLinkRemoval {
+            Application::with_faults(
+                &environment,
+                &SwapAtRemoval {
+                    path: managed.clone(),
+                },
+            )
+            .disable("tool")
+            .unwrap_err();
+            assert_eq!(fs::read_to_string(&managed).unwrap(), "externally replaced");
+        } else {
+            Application::with_faults(&environment, &FailAt(boundary))
+                .disable("tool")
+                .unwrap_err();
+            assert_eq!(fs::read_link(&managed).unwrap(), unexpected);
+        }
+        assert!(
+            list(&environment).unwrap().registrations[0]
+                .registration
+                .enabled
+        );
+    }
+}
+
+#[test]
 fn disable_revalidates_ownership_at_the_removal_boundary() {
     let temp = TempDir::new().unwrap();
     let target = temp.path().join("project/tool");
