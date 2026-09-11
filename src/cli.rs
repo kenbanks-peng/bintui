@@ -35,6 +35,9 @@ enum Operation {
     },
     /// List all Registrations.
     List {
+        /// Print only link names in text output.
+        #[arg(long)]
+        link: bool,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -134,8 +137,8 @@ pub fn run() -> i32 {
             }
             Err(error) => print_error(format, "search-failed", error, &paths),
         },
-        Some(Operation::List { format }) => match list(&environment) {
-            Ok(result) => print_list_result(format, &result, &paths),
+        Some(Operation::List { format, link }) => match list(&environment) {
+            Ok(result) => print_list_result(format, link, &result, &paths),
             Err(error) => print_error(format, "operation-failed", error, &paths),
         },
         Some(Operation::Add {
@@ -250,12 +253,20 @@ fn print_identifier_result(format: OutputFormat, identifier: &str) -> i32 {
     0
 }
 
-fn print_list_result(format: OutputFormat, result: &ListResult, paths: &PathDisplay<'_>) -> i32 {
+fn print_list_result(
+    format: OutputFormat,
+    link: bool,
+    result: &ListResult,
+    paths: &PathDisplay<'_>,
+) -> i32 {
     match format {
         OutputFormat::Json => print_json(result),
         OutputFormat::Text => {
-            println!("Result: {}", result.identifier);
             for state in &result.registrations {
+                if link {
+                    println!("{}", state.registration.name);
+                    continue;
+                }
                 let mut annotations = Vec::new();
                 if !state.registration.enabled {
                     annotations.push("disabled");
@@ -264,15 +275,21 @@ fn print_list_result(format: OutputFormat, result: &ListResult, paths: &PathDisp
                     annotations.push(defect.kind.identifier());
                 }
 
-                let linked_item = format!(
-                    "{} -> {}",
-                    state.registration.name,
-                    paths.path(&state.registration.target)
-                );
+                let name = &state.registration.name;
+                let mut item = paths.path(&state.registration.target);
+                if state
+                    .registration
+                    .target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(name.as_str())
+                {
+                    item.push_str(&format!(" ({name})"));
+                }
                 if annotations.is_empty() {
-                    println!("{linked_item}");
+                    println!("{item}");
                 } else {
-                    println!("{linked_item} [{}]", annotations.join("; "));
+                    println!("{item} [{}]", annotations.join("; "));
                 }
             }
         }

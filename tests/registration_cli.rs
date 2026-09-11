@@ -73,7 +73,10 @@ fn lifecycle_commands_and_list_present_the_shared_application_results() {
         .args(["list", "--format", "text"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("tool -> "))
+        .stdout(predicate::str::ends_with("project/tool\n"))
+        .stdout(predicate::str::contains("(tool)").not())
+        .stdout(predicate::str::contains("Result:").not())
+        .stdout(predicate::str::contains("registrations-listed").not())
         .stdout(predicate::str::contains("enabled").not())
         .stdout(predicate::str::contains("no defects").not())
         .stdout(predicate::str::contains("disabled").not());
@@ -90,13 +93,88 @@ fn lifecycle_commands_and_list_present_the_shared_application_results() {
         .args(["list", "--format", "text"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("tool -> "))
-        .stdout(predicate::str::contains("[disabled]"))
+        .stdout(predicate::str::ends_with("project/tool [disabled]\n"))
+        .stdout(predicate::str::contains("(tool)").not())
         .stdout(predicate::str::contains("no defects").not());
     command(temp.path(), temp.path())
         .args(["remove", "tool"])
         .assert()
         .success();
+}
+
+#[test]
+fn list_link_prints_only_link_names() {
+    let temp = TempDir::new().unwrap();
+    command(temp.path(), temp.path())
+        .args(["list", "--link"])
+        .assert()
+        .success()
+        .stdout("");
+
+    for name in ["alpha", "beta"] {
+        let target = temp.path().join(format!("project/target-{name}"));
+        executable(&target);
+        command(temp.path(), temp.path())
+            .args([
+                "add",
+                "--disabled",
+                "--name",
+                name,
+                target.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    }
+    command(temp.path(), temp.path())
+        .args(["list", "--link"])
+        .assert()
+        .success()
+        .stdout("alpha\nbeta\n");
+    command(temp.path(), temp.path())
+        .args(["list", "--link", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("registrations-listed"))
+        .stdout(predicate::str::contains("target-alpha"));
+}
+
+#[test]
+fn text_list_shows_custom_link_names_after_targets() {
+    let temp = TempDir::new().unwrap();
+    for (name, relative_target) in [("a", "project/short"), ("long-name", "project/longer-tool")] {
+        let target = temp.path().join(relative_target);
+        executable(&target);
+        command(temp.path(), temp.path())
+            .args([
+                "add",
+                "--disabled",
+                "--name",
+                name,
+                target.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    }
+
+    let output = command(temp.path(), temp.path())
+        .args(["list", "--format", "text"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(!text.contains("->"));
+    assert!(lines
+        .iter()
+        .any(|line| line.ends_with("project/short (a) [disabled]")));
+    assert!(lines
+        .iter()
+        .any(|line| line.ends_with("project/longer-tool (long-name) [disabled]")));
+    assert!(lines.iter().all(|line| !line.contains("  ")));
+    assert!(lines.iter().all(|line| !line.ends_with(' ')));
 }
 
 #[test]
