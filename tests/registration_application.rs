@@ -420,7 +420,7 @@ fn disable_removes_a_live_unexpected_link_and_allows_unregister() {
 }
 
 #[test]
-fn disable_leaves_regular_files_and_directories_untouched() {
+fn disable_removes_regular_files_but_leaves_directories_untouched() {
     for directory in [false, true] {
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("project/tool");
@@ -438,6 +438,7 @@ fn disable_leaves_regular_files_and_directories_untouched() {
         .registration
         .unwrap()
         .managed_link;
+        fs::remove_file(fs::read_link(&managed).unwrap()).unwrap();
         fs::remove_file(&managed).unwrap();
         if directory {
             fs::create_dir(&managed).unwrap();
@@ -445,17 +446,165 @@ fn disable_leaves_regular_files_and_directories_untouched() {
             fs::write(&managed, "replacement").unwrap();
         }
         let result = disable("tool", &environment).unwrap();
-        assert_eq!(result.identifier, "managed-path-conflict");
+        if directory {
+            assert_eq!(result.identifier, "managed-path-conflict");
+            assert!(
+                list(&environment).unwrap().registrations[0]
+                    .registration
+                    .enabled
+            );
+            assert!(managed.is_dir());
+        } else {
+            assert_eq!(result.identifier, "registration-disabled");
+            assert!(
+                !list(&environment).unwrap().registrations[0]
+                    .registration
+                    .enabled
+            );
+            assert!(fs::symlink_metadata(&managed).is_err());
+            assert_eq!(fs::read_dir(managed.parent().unwrap()).unwrap().count(), 0);
+            assert_eq!(
+                remove("tool", &environment).unwrap().identifier,
+                "registration-removed"
+            );
+            assert!(list(&environment).unwrap().registrations.is_empty());
+        }
+    }
+}
+
+#[test]
+fn regular_file_disable_preserves_replacements_and_committed_state() {
+    struct ReplaceDuringSave(PathBuf);
+    impl MutationFaultInjector for ReplaceDuringSave {
+        fn check(&self, boundary: MutationBoundary) -> std::io::Result<()> {
+            if boundary == MutationBoundary::TemporaryRegistryWrite {
+                fs::write(&self.0, "replacement during save")?;
+                return Err(std::io::Error::other("save failed"));
+            }
+            Ok(())
+        }
+    }
+
+    for scenario in [0, 1, 2] {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("project/tool");
+        executable(&target);
+        let environment = environment(temp.path());
+        let managed = add(
+            AddRequest {
+                target,
+                name: None,
+                disabled: false,
+            },
+            &environment,
+        )
+        .unwrap()
+        .registration
+        .unwrap()
+        .managed_link;
+        fs::remove_file(&managed).unwrap();
+        fs::write(&managed, "original file").unwrap();
+        match scenario {
+            0 => {
+                Application::with_faults(
+                    &environment,
+                    &SwapAtRemoval {
+                        path: managed.clone(),
+                    },
+                )
+                .disable("tool")
+                .unwrap_err();
+                assert_eq!(fs::read_to_string(&managed).unwrap(), "externally replaced");
+                assert!(
+                    list(&environment).unwrap().registrations[0]
+                        .registration
+                        .enabled
+                );
+                assert_eq!(fs::read_dir(managed.parent().unwrap()).unwrap().count(), 1);
+            }
+            1 => {
+                let error =
+                    Application::with_faults(&environment, &ReplaceDuringSave(managed.clone()))
+                        .disable("tool")
+                        .unwrap_err();
+                assert_eq!(
+                    fs::read_to_string(&managed).unwrap(),
+                    "replacement during save"
+                );
+                assert!(
+                    list(&environment).unwrap().registrations[0]
+                        .registration
+                        .enabled
+                );
+                let backups: Vec<_> = fs::read_dir(managed.parent().unwrap())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path != &managed)
+                    .collect();
+                assert_eq!(backups.len(), 1);
+                assert_eq!(fs::read_to_string(&backups[0]).unwrap(), "original file");
+                assert!(error
+                    .to_string()
+                    .contains(&backups[0].display().to_string()));
+            }
+            _ => {
+                Application::with_faults(
+                    &environment,
+                    &FailAt(MutationBoundary::RegistryDirectorySync),
+                )
+                .disable("tool")
+                .unwrap_err();
+                assert!(
+                    !list(&environment).unwrap().registrations[0]
+                        .registration
+                        .enabled
+                );
+                assert!(fs::symlink_metadata(&managed).is_err());
+                assert_eq!(fs::read_dir(managed.parent().unwrap()).unwrap().count(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn regular_file_disable_restores_the_file_on_registry_failure() {
+    for boundary in [
+        MutationBoundary::TemporaryRegistryWrite,
+        MutationBoundary::RegistrySync,
+        MutationBoundary::AtomicRegistryReplacement,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("project/tool");
+        executable(&target);
+        let environment = environment(temp.path());
+        let managed = add(
+            AddRequest {
+                target: target.clone(),
+                name: None,
+                disabled: false,
+            },
+            &environment,
+        )
+        .unwrap()
+        .registration
+        .unwrap()
+        .managed_link;
+        fs::remove_file(&target).unwrap();
+        fs::remove_file(&managed).unwrap();
+        executable(&managed);
+        let contents = fs::read(&managed).unwrap();
+        let mode = fs::metadata(&managed).unwrap().permissions().mode();
+        Application::with_faults(&environment, &FailAt(boundary))
+            .disable("tool")
+            .unwrap_err();
+        assert_eq!(fs::read(&managed).unwrap(), contents);
+        assert_eq!(fs::metadata(&managed).unwrap().permissions().mode(), mode);
         assert!(
             list(&environment).unwrap().registrations[0]
                 .registration
                 .enabled
         );
-        if directory {
-            assert!(managed.is_dir());
-        } else {
-            assert_eq!(fs::read_to_string(&managed).unwrap(), "replacement");
-        }
+        assert_eq!(fs::read_dir(managed.parent().unwrap()).unwrap().count(), 1);
     }
 }
 

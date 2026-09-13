@@ -2,7 +2,9 @@
 //!
 //! Mutations cannot atomically update both a Registry file and a Managed Link. Enabled add and
 //! enable therefore create the safe link before atomically persisting desired state; disable and
-//! remove first verify and remove only an owned link, then persist. A failed pre-commit Registry
+//! remove first verify and remove the managed path, then persist. Explicit disable also permits
+//! unexpected symbolic links and regular files; regular files have a temporary hard-link backup.
+//! A failed pre-commit Registry
 //! replacement rolls the link operation back when it is still safe to do so. Once replacement has
 //! committed, including a later directory-sync failure, the new Registry state is authoritative
 //! and the link is not rolled back. Every operation holds the Registry writer lock while it
@@ -10,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -389,6 +391,13 @@ fn set_enabled(
     let managed_link = managed_link(&configuration.bin_dir, name)?;
     let path_exists = fs::symlink_metadata(&managed_link).is_ok();
     let owned = is_owned_link(&managed_link, &existing.target);
+    let removable_file = if !enabled {
+        fs::symlink_metadata(&managed_link)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+    } else {
+        None
+    };
     // Explicit disable may remove any symbolic link at the managed path.
     // Keep the observed target for removal revalidation and rollback.
     let removable_target = if owned {
@@ -398,7 +407,7 @@ fn set_enabled(
     } else {
         None
     };
-    if path_exists && removable_target.is_none() {
+    if path_exists && removable_target.is_none() && removable_file.is_none() {
         return blocked(existing, &configuration.bin_dir, "managed-path-conflict");
     }
     if existing.enabled == enabled && ((enabled && owned) || (!enabled && !path_exists)) {
@@ -417,6 +426,7 @@ fn set_enabled(
     {
         validate_target(&existing.target)?;
     }
+    let mut removed_file = None;
     if enabled && !owned {
         fs::create_dir_all(&configuration.bin_dir).map_err(|source| {
             ApplicationError::CreateManagedDirectory {
@@ -440,6 +450,15 @@ fn set_enabled(
         if !enabled {
             remove_owned_link(&managed_link, target, faults)?;
         }
+    } else if let Some(metadata) = &removable_file {
+        removed_file = Some(
+            RemovedRegularFile::remove(&managed_link, metadata, faults).map_err(|source| {
+                ApplicationError::RemoveManagedLink {
+                    path: managed_link.clone(),
+                    source,
+                }
+            })?,
+        );
     }
     let mut updated = existing.clone();
     updated.enabled = enabled;
@@ -453,6 +472,15 @@ fn set_enabled(
         if !error.replacement_committed() {
             if enabled {
                 let _ = remove_owned_link(&managed_link, &existing.target, &NoMutationFaults);
+            } else if let Some(backup) = &mut removed_file {
+                // hard_link never overwrites a replacement at the original path.
+                if let Err(source) = fs::hard_link(&backup.path, &managed_link) {
+                    backup.preserve = true;
+                    return Err(ApplicationError::InvalidInput(format!(
+                        "Registry update failed: {error}; file recovery failed: {source}; recover the file from {}",
+                        backup.path.display()
+                    )));
+                }
             } else if let Some(target) = &removable_target {
                 if fs::symlink_metadata(&managed_link).is_err() {
                     let _ = symlink(target, &managed_link);
@@ -861,6 +889,70 @@ fn is_owned_link(path: &Path, target: &Path) -> bool {
     fs::read_link(path)
         .map(|actual| actual == target)
         .unwrap_or(false)
+}
+
+/// Keeps the original inode until the Registry update has committed or rolled back.
+struct RemovedRegularFile {
+    path: PathBuf,
+    preserve: bool,
+}
+
+impl RemovedRegularFile {
+    fn remove(
+        path: &Path,
+        expected: &fs::Metadata,
+        faults: &dyn MutationFaultInjector,
+    ) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_BACKUP: AtomicU64 = AtomicU64::new(0);
+        let backup = loop {
+            let candidate = path
+                .parent()
+                .expect("managed path has a parent")
+                .join(format!(
+                    ".bintui-disable-{}-{}",
+                    std::process::id(),
+                    NEXT_BACKUP.fetch_add(1, Ordering::Relaxed)
+                ));
+            match fs::hard_link(path, &candidate) {
+                Ok(()) => {
+                    break Self {
+                        path: candidate,
+                        preserve: false,
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        let same_file = |metadata: &fs::Metadata| {
+            metadata.is_file()
+                && metadata.dev() == expected.dev()
+                && metadata.ino() == expected.ino()
+        };
+        if !same_file(&fs::symlink_metadata(&backup.path)?) {
+            return Err(std::io::Error::other(
+                "Managed file changed before backup; it was left untouched",
+            ));
+        }
+        faults.check(MutationBoundary::ManagedLinkRemoval)?;
+        if !same_file(&fs::symlink_metadata(path)?) {
+            return Err(std::io::Error::other(
+                "Managed file changed before removal; it was left untouched",
+            ));
+        }
+        fs::remove_file(path)?;
+        Ok(backup)
+    }
+}
+
+impl Drop for RemovedRegularFile {
+    fn drop(&mut self) {
+        // Keep the backup for manual recovery only if rollback failed.
+        if !self.preserve {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn remove_owned_link(
