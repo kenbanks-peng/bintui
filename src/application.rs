@@ -389,13 +389,11 @@ fn set_enabled(
     let managed_link = managed_link(&configuration.bin_dir, name)?;
     let path_exists = fs::symlink_metadata(&managed_link).is_ok();
     let owned = is_owned_link(&managed_link, &existing.target);
-    // Disable may remove a dangling link even when its target has changed.
+    // Explicit disable may remove any symbolic link at the managed path.
     // Keep the observed target for removal revalidation and rollback.
     let removable_target = if owned {
         Some(existing.target.clone())
-    } else if !enabled
-        && matches!(fs::metadata(&managed_link), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    {
+    } else if !enabled {
         fs::read_link(&managed_link).ok()
     } else {
         None

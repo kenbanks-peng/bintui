@@ -340,7 +340,7 @@ fn duplicate_names_and_unmanaged_paths_are_blocked_without_replacement() {
 }
 
 #[test]
-fn lifecycle_mutations_block_unmanaged_entries_and_changed_registered_links() {
+fn enable_and_remove_block_changed_registered_links() {
     let temp = TempDir::new().unwrap();
     let target = temp.path().join("project/tool");
     let other = temp.path().join("project/other");
@@ -361,7 +361,7 @@ fn lifecycle_mutations_block_unmanaged_entries_and_changed_registered_links() {
     symlink(&other, &managed).unwrap();
 
     for result in [
-        disable("tool", &environment).unwrap(),
+        enable("tool", &environment).unwrap(),
         remove("tool", &environment).unwrap(),
     ] {
         assert_eq!(result.status, LifecycleStatus::Blocked);
@@ -369,6 +369,94 @@ fn lifecycle_mutations_block_unmanaged_entries_and_changed_registered_links() {
         assert_eq!(fs::read_link(&managed).unwrap(), other);
     }
     assert_eq!(list(&environment).unwrap().registrations.len(), 1);
+}
+
+#[test]
+fn disable_removes_a_live_unexpected_link_and_allows_unregister() {
+    for missing_target in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("project/tool");
+        let other = temp.path().join("project/other");
+        executable(&target);
+        executable(&other);
+        let other_contents = fs::read(&other).unwrap();
+        let environment = environment(temp.path());
+        let managed = add(
+            AddRequest {
+                target: target.clone(),
+                name: None,
+                disabled: false,
+            },
+            &environment,
+        )
+        .unwrap()
+        .registration
+        .unwrap()
+        .managed_link;
+        fs::remove_file(&managed).unwrap();
+        symlink(&other, &managed).unwrap();
+        if missing_target {
+            fs::remove_file(&target).unwrap();
+        }
+
+        let disabled = disable("tool", &environment).unwrap();
+        assert_eq!(disabled.identifier, "registration-disabled");
+        assert!(!disabled.registration.unwrap().registration.enabled);
+        assert!(fs::symlink_metadata(&managed).is_err());
+        assert!(
+            !list(&environment).unwrap().registrations[0]
+                .registration
+                .enabled
+        );
+        assert_eq!(fs::read(&other).unwrap(), other_contents);
+
+        assert_eq!(
+            remove("tool", &environment).unwrap().identifier,
+            "registration-removed"
+        );
+        assert!(list(&environment).unwrap().registrations.is_empty());
+        assert_eq!(fs::read(&other).unwrap(), other_contents);
+    }
+}
+
+#[test]
+fn disable_leaves_regular_files_and_directories_untouched() {
+    for directory in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("project/tool");
+        executable(&target);
+        let environment = environment(temp.path());
+        let managed = add(
+            AddRequest {
+                target,
+                name: None,
+                disabled: false,
+            },
+            &environment,
+        )
+        .unwrap()
+        .registration
+        .unwrap()
+        .managed_link;
+        fs::remove_file(&managed).unwrap();
+        if directory {
+            fs::create_dir(&managed).unwrap();
+        } else {
+            fs::write(&managed, "replacement").unwrap();
+        }
+        let result = disable("tool", &environment).unwrap();
+        assert_eq!(result.identifier, "managed-path-conflict");
+        assert!(
+            list(&environment).unwrap().registrations[0]
+                .registration
+                .enabled
+        );
+        if directory {
+            assert!(managed.is_dir());
+        } else {
+            assert_eq!(fs::read_to_string(&managed).unwrap(), "replacement");
+        }
+    }
 }
 
 #[test]
@@ -453,52 +541,57 @@ fn missing_target_can_be_enabled_disabled_and_unregistered() {
 }
 
 #[test]
-fn broken_link_disable_preserves_replacements_and_restores_original_link_on_failure() {
-    for boundary in [
-        MutationBoundary::ManagedLinkRemoval,
-        MutationBoundary::TemporaryRegistryWrite,
-    ] {
-        let temp = TempDir::new().unwrap();
-        let target = temp.path().join("project/tool");
-        executable(&target);
-        let environment = environment(temp.path());
-        let managed = add(
-            AddRequest {
-                target,
-                name: None,
-                disabled: false,
-            },
-            &environment,
-        )
-        .unwrap()
-        .registration
-        .unwrap()
-        .managed_link;
-        let unexpected = PathBuf::from("../../missing/other");
-        fs::remove_file(&managed).unwrap();
-        symlink(&unexpected, &managed).unwrap();
-
-        if boundary == MutationBoundary::ManagedLinkRemoval {
-            Application::with_faults(
-                &environment,
-                &SwapAtRemoval {
-                    path: managed.clone(),
+fn unexpected_link_disable_preserves_replacements_and_restores_original_link_on_failure() {
+    for live_link in [false, true] {
+        for boundary in [
+            MutationBoundary::ManagedLinkRemoval,
+            MutationBoundary::TemporaryRegistryWrite,
+        ] {
+            let temp = TempDir::new().unwrap();
+            let target = temp.path().join("project/tool");
+            executable(&target);
+            let environment = environment(temp.path());
+            let managed = add(
+                AddRequest {
+                    target,
+                    name: None,
+                    disabled: false,
                 },
+                &environment,
             )
-            .disable("tool")
-            .unwrap_err();
-            assert_eq!(fs::read_to_string(&managed).unwrap(), "externally replaced");
-        } else {
-            Application::with_faults(&environment, &FailAt(boundary))
+            .unwrap()
+            .registration
+            .unwrap()
+            .managed_link;
+            let unexpected = PathBuf::from("../../missing/other");
+            fs::remove_file(&managed).unwrap();
+            symlink(&unexpected, &managed).unwrap();
+            if live_link {
+                executable(&managed.parent().unwrap().join(&unexpected));
+            }
+
+            if boundary == MutationBoundary::ManagedLinkRemoval {
+                Application::with_faults(
+                    &environment,
+                    &SwapAtRemoval {
+                        path: managed.clone(),
+                    },
+                )
                 .disable("tool")
                 .unwrap_err();
-            assert_eq!(fs::read_link(&managed).unwrap(), unexpected);
+                assert_eq!(fs::read_to_string(&managed).unwrap(), "externally replaced");
+            } else {
+                Application::with_faults(&environment, &FailAt(boundary))
+                    .disable("tool")
+                    .unwrap_err();
+                assert_eq!(fs::read_link(&managed).unwrap(), unexpected);
+            }
+            assert!(
+                list(&environment).unwrap().registrations[0]
+                    .registration
+                    .enabled
+            );
         }
-        assert!(
-            list(&environment).unwrap().registrations[0]
-                .registration
-                .enabled
-        );
     }
 }
 
