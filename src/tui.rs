@@ -28,7 +28,7 @@ use crate::application::{self, AddRequest, ApplicationError, SearchRequest};
 use crate::config_git::{BackgroundGitSync, ConfigGitSync};
 use crate::environment::Environment;
 use crate::model::{
-    Candidate, LifecycleResult, ListResult, ManagedPathKind, PathStatus, RegistrationState,
+    Candidate, ConflictKind, LifecycleResult, ListResult, ManagedPathKind, PathStatus, RegistrationState,
     SearchResult,
 };
 use crate::theme;
@@ -180,7 +180,7 @@ struct ListEntry {
     name: String,
     target: PathBuf,
     registration: Option<RegistrationState>,
-    unavailable: bool,
+    conflict: Option<ConflictKind>,
 }
 
 impl ListEntry {
@@ -188,7 +188,7 @@ impl ListEntry {
         Self {
             target: candidate.target,
             registration: candidate.registration,
-            unavailable: candidate.conflict.is_some(),
+            conflict: candidate.conflict.map(|conflict| conflict.kind),
             name,
         }
     }
@@ -198,7 +198,7 @@ impl ListEntry {
             name: registration.registration.name.clone(),
             target: registration.registration.target.clone(),
             registration: Some(registration),
-            unavailable: false,
+            conflict: None,
         }
     }
 }
@@ -858,14 +858,17 @@ impl Controller {
             .iter()
             .filter(|entry| entry_matches_filter(entry, &self.filter))
             .map(|entry| {
-                let status = if entry.unavailable {
-                    "unavailable".to_owned()
-                } else {
-                    entry
+                let status = match entry.conflict {
+                    Some(ConflictKind::DuplicateProposedName) => "duplicate".to_owned(),
+                    Some(ConflictKind::CommandNameRegistered) => {
+                        "unavailable · duplicate".to_owned()
+                    }
+                    Some(ConflictKind::ManagedPathOccupied) => "unavailable".to_owned(),
+                    None => entry
                         .registration
                         .as_ref()
                         .map(Self::registration_status)
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
                 };
                 let error_key = match self.view {
                     View::Discover => entry.target.display().to_string(),
@@ -1588,7 +1591,7 @@ mod tests {
                 name: format!("tool{index:02}"),
                 target: PathBuf::from(format!("/project/tool{index:02}")),
                 registration: None,
-                unavailable: false,
+                conflict: None,
             })
             .collect();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();

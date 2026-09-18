@@ -99,6 +99,41 @@ fn starts_with_automatic_discovery_at_explicit_root() {
 }
 
 #[test]
+fn discover_duplicate_status_tracks_name_registration() {
+    use bintui::model::{ConflictKind, NameConflict};
+
+    let mut result = search_result("/project", &["tool", "tool"]);
+    result.candidates[0].target = PathBuf::from("/project/a/tool");
+    result.candidates[1].target = PathBuf::from("/project/b/tool");
+    for index in 0..2 {
+        result.candidates[index].conflict = Some(NameConflict {
+            kind: ConflictKind::DuplicateProposedName,
+            conflicting_target: result.candidates[1 - index].target.clone(),
+        });
+    }
+    let mut controller = Controller::new(PathBuf::from("/project"));
+    controller.take_request();
+    controller.complete(OperationResult::Search(Ok(result.clone())));
+    let state = controller.semantic_state(80, 24);
+    assert_eq!(state.items.len(), 2);
+    assert!(state.items.iter().all(|item| item.status == "duplicate" && !item.checked));
+
+    successfully_register_focused_candidate(&mut controller);
+    result.candidates[0].registration = Some(registration_state("tool", "/project/a/tool", None));
+    result.candidates[0].conflict = None;
+    result.candidates[1].conflict = Some(NameConflict {
+        kind: ConflictKind::CommandNameRegistered,
+        conflicting_target: PathBuf::from("/project/a/tool"),
+    });
+    controller.complete(OperationResult::Search(Ok(result)));
+    let state = controller.semantic_state(80, 24);
+    let registered = state.items.iter().find(|item| item.checked).unwrap();
+    assert_eq!(registered.status, "");
+    let duplicate = state.items.iter().find(|item| !item.checked).unwrap();
+    assert_eq!(duplicate.status, "unavailable · duplicate");
+}
+
+#[test]
 fn initial_discovery_hides_registered_candidates() {
     let mut result = search_result("/project", &["alpha", "zulu"]);
     result.candidates[0].registration = Some(registration_state("alpha", "/project/alpha", None));
