@@ -161,6 +161,7 @@ pub struct SemanticState {
     pub filter: String,
     pub filter_active: bool,
     pub empty_message: Option<String>,
+    pub scanning: bool,
     pub compact: bool,
     pub dialog: Option<String>,
     pub notice: Option<String>,
@@ -288,6 +289,7 @@ pub struct Controller {
     dialog: Option<Dialog>,
     pending: Option<Request>,
     mutation_active: bool,
+    scanning: bool,
     preserve_registration_order: bool,
     pending_add: Option<(PathBuf, String)>,
     active_add_target: Option<PathBuf>,
@@ -329,6 +331,7 @@ impl Controller {
             registrations: ItemList::default(),
             dialog: None,
             mutation_active: false,
+            scanning: false,
             preserve_registration_order: false,
             pending_add: None,
             active_add_target: None,
@@ -357,10 +360,17 @@ impl Controller {
         self.emitted_mutation
     }
     pub fn take_request(&mut self) -> Option<Request> {
-        self.pending.take()
+        let request = self.pending.take();
+        if matches!(request, Some(Request::Search(_))) {
+            self.scanning = true;
+        }
+        request
     }
 
     pub fn complete(&mut self, result: OperationResult) {
+        if matches!(result, OperationResult::Search(_)) {
+            self.scanning = false;
+        }
         match result {
             OperationResult::Search(Ok(mut result)) => {
                 self.discovery_warning = self.format_search_warnings(&result.warnings);
@@ -889,12 +899,14 @@ impl Controller {
                 }
             })
             .collect();
+        let scanning = self.scanning || matches!(self.pending, Some(Request::Search(_)));
         let empty_message = if items.is_empty() {
             Some(
                 if !self.filter.is_empty() && !self.active_list().entries.is_empty() {
                     format!("No matches for {:?}", self.filter)
                 } else {
                     match self.view {
+                        View::Discover if scanning => "Scanning for executables…".to_owned(),
                         View::Discover => "No executable candidates found".to_owned(),
                         View::Registrations => "No Registrations".to_owned(),
                     }
@@ -912,6 +924,7 @@ impl Controller {
             filter: self.filter.clone(),
             filter_active: self.filter_active,
             empty_message,
+            scanning,
             compact: width < 50 || height < 10,
             dialog: self
                 .dialog
@@ -993,6 +1006,7 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
     let mut session = TerminalSession::enter().map_err(|e| e.to_string())?;
     let mut controller = Controller::with_roots(root, environment.home().to_path_buf(), roots);
     let mut worker = BackgroundRunner::new();
+    let mut discovery_worker = BackgroundRunner::new();
     let git_sync = BackgroundGitSync::start();
     if let Ok(diagnostic) = application::path_diagnostic(environment) {
         if diagnostic.status == PathStatus::Missing {
@@ -1003,6 +1017,15 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
         }
     }
     loop {
+        if let Some(result) = discovery_worker.try_take()? {
+            controller.scanning = false;
+            // A mutation or queued rescan makes this snapshot obsolete.
+            if !controller.mutation_active
+                && !matches!(controller.pending, Some(Request::Search(_)))
+            {
+                controller.complete(result);
+            }
+        }
         if let Some(result) = worker.try_take()? {
             controller.complete(result);
         }
@@ -1017,12 +1040,14 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
             let pending_error = git_sync.finish().into_iter().find_map(Result::err);
             return pending_error.map_or(Ok(()), |error| Err(error.to_string()));
         }
-        if !controller.should_exit() && !worker.is_active() {
-            if let Some(request) = controller.take_request() {
-                let environment = environment.clone();
-                let git_sync = git_sync.policy();
-                worker.start(move || execute_request(request, &environment, &git_sync))?;
-            }
+        if !controller.should_exit() {
+            start_pending_request(
+                &mut controller,
+                &mut worker,
+                &mut discovery_worker,
+                environment,
+                &git_sync.policy(),
+            )?;
         }
         session
             .terminal
@@ -1037,6 +1062,30 @@ pub fn run(search_root: Option<PathBuf>, environment: &Environment) -> Result<()
             }
         }
     }
+}
+
+// Discovery can traverse a large tree. It must not hold up registry reads,
+// mutations, or exiting the TUI.
+fn start_pending_request(
+    controller: &mut Controller,
+    worker: &mut BackgroundRunner<OperationResult>,
+    discovery_worker: &mut BackgroundRunner<OperationResult>,
+    environment: &Environment,
+    git_sync: &ConfigGitSync,
+) -> Result<(), String> {
+    let runner = match controller.pending.as_ref() {
+        Some(Request::Search(_)) => discovery_worker,
+        Some(_) => worker,
+        None => return Ok(()),
+    };
+    if !runner.is_active() {
+        if let Some(request) = controller.take_request() {
+            let environment = environment.clone();
+            let git_sync = git_sync.clone();
+            runner.start(move || execute_request(request, &environment, &git_sync))?;
+        }
+    }
+    Ok(())
 }
 
 struct BackgroundRunner<T> {
@@ -1094,10 +1143,79 @@ impl<T: Send + 'static> BackgroundRunner<T> {
 
 #[cfg(test)]
 mod background_runner_tests {
-    use super::BackgroundRunner;
+    use super::{start_pending_request, BackgroundRunner, Controller, Event, OperationResult, View};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn registrations_load_while_discovery_is_blocked_outside_a_git_repo() {
+        use crate::config_git::ConfigGitSync;
+        use crate::environment::Environment;
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::time::Instant;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = home.path().join("Software");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = home.path().join(".config/bintui");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("registry.toml"),
+            "version = 1\n[[command]]\nname = \"tool\"\ntarget = \"~/elsewhere/tool\"\nenabled = false\n",
+        )
+        .unwrap();
+        let environment = Environment::from_values(
+            home.path().to_path_buf(),
+            cwd.clone(),
+            BTreeMap::new(),
+        );
+        let mut controller = Controller::new(cwd);
+        controller.take_request();
+        let mut worker = BackgroundRunner::new();
+        let mut discovery_worker = BackgroundRunner::new();
+        let (release_sender, release_receiver) = mpsc::channel();
+        discovery_worker
+            .start(move || {
+                release_receiver.recv().unwrap();
+                OperationResult::List(crate::application::list(&environment).map_err(Into::into))
+            })
+            .unwrap();
+        let environment = Environment::from_values(
+            home.path().to_path_buf(),
+            home.path().join("Software"),
+            BTreeMap::new(),
+        );
+
+        controller.handle(Event::SwitchView);
+        start_pending_request(
+            &mut controller,
+            &mut worker,
+            &mut discovery_worker,
+            &environment,
+            &ConfigGitSync::blocking(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Some(result) = worker.try_take().unwrap() {
+                break Some(result);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::yield_now();
+        };
+        assert!(discovery_worker.is_active());
+        release_sender.send(()).unwrap();
+        controller.complete(result.expect("registry loading waited for discovery"));
+        let state = controller.semantic_state(80, 24);
+        assert_eq!(state.view, View::Registrations);
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].name, "tool");
+    }
 
     #[test]
     fn task_runs_without_blocking_the_calling_thread() {
@@ -1322,6 +1440,7 @@ fn render(frame: &mut Frame, controller: &mut Controller) {
             .borders(Borders::ALL)
             .style(theme::panel())
             .border_style(theme::border())
+            .title(if state.scanning { " Scanning… " } else { "" })
     };
     if let Some(empty) = state.empty_message {
         frame.render_widget(

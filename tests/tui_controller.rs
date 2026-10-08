@@ -99,6 +99,30 @@ fn starts_with_automatic_discovery_at_explicit_root() {
 }
 
 #[test]
+fn scanning_indicator_tracks_pending_active_completed_and_failed_searches() {
+    let mut controller = Controller::new(PathBuf::from("/Software"));
+    assert!(controller.semantic_state(80, 24).scanning);
+    assert_eq!(
+        controller.semantic_state(80, 24).empty_message.as_deref(),
+        Some("Scanning for executables…")
+    );
+    controller.take_request();
+    controller.handle(Event::SwitchView);
+    assert!(controller.semantic_state(80, 24).scanning);
+    controller.take_request();
+    controller.complete(OperationResult::Search(Ok(search_result("/Software", &[]))));
+    assert!(!controller.semantic_state(80, 24).scanning);
+
+    controller.handle(Event::SwitchView);
+    assert!(controller.semantic_state(80, 24).scanning);
+    controller.take_request();
+    controller.complete(OperationResult::Search(Err(
+        bintui::tui::OperationError::new("search-failed", "scan failed"),
+    )));
+    assert!(!controller.semantic_state(80, 24).scanning);
+}
+
+#[test]
 fn discover_duplicate_status_tracks_name_registration() {
     use bintui::model::{ConflictKind, NameConflict};
 
