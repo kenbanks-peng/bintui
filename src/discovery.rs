@@ -19,7 +19,11 @@ pub fn discover(
     ignored_patterns: &[String],
     ignored_paths: &BTreeSet<PathBuf>,
 ) -> std::io::Result<Discovery> {
-    if ignored_paths.iter().any(|ignored| root.starts_with(ignored)) {
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if ignored_paths
+        .iter()
+        .any(|ignored| root.starts_with(ignored) || canonical_root.starts_with(ignored))
+    {
         return Ok(Discovery {
             targets: Vec::new(),
             warnings: Vec::new(),
@@ -37,7 +41,15 @@ pub fn discover(
         targets: Vec::new(),
         warnings: Vec::new(),
     };
-    visit(root, bin_dir, &ignored, ignored_paths, &mut discovery);
+    // Directory entries keep the search root's spelling, which can differ
+    // from canonical paths (for example, /var and /private/var on macOS).
+    let mut resolved_ignored_paths = ignored_paths.clone();
+    for excluded in ignored_paths {
+        if let Ok(relative) = excluded.strip_prefix(&canonical_root) {
+            resolved_ignored_paths.insert(root.join(relative));
+        }
+    }
+    visit(root, bin_dir, &ignored, &resolved_ignored_paths, &mut discovery);
     discovery.targets.sort();
     Ok(discovery)
 }

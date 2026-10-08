@@ -115,7 +115,15 @@ pub fn load(environment: &Environment) -> Result<Configuration, ConfigurationErr
         for value in &config.exclude_paths {
             let excluded = expand_path(value, environment)?;
             require_absolute("exclude_paths", &excluded)?;
-            exclude_paths.push(normalize(&excluded));
+            let excluded = normalize(&excluded);
+            // Retain the configured spelling for paths that do not exist yet.
+            // Also match the filesystem spelling (case and directory symlinks).
+            if let Ok(canonical) = fs::canonicalize(&excluded) {
+                if canonical != excluded {
+                    exclude_paths.push(canonical);
+                }
+            }
+            exclude_paths.push(excluded);
         }
     }
     let configured_bin = parsed.as_ref().and_then(|config| config.bin_dir.as_deref());

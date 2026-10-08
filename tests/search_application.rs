@@ -476,3 +476,31 @@ fn configured_excluded_paths_prune_subtrees_even_when_search_starts_inside_them(
         assert!(result.warnings.is_empty());
     }
 }
+
+#[test]
+fn configured_exclusion_resolves_directory_aliases() {
+    let temp = TempDir::new().unwrap();
+    let actual = temp.path().join("Software/ToolChain/cargo");
+    file(&actual.join("hidden"), 0o755);
+    symlink(
+        temp.path().join("Software/ToolChain"),
+        temp.path().join("alias"),
+    )
+    .unwrap();
+    let config = temp.path().join(".config/bintui/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "version = 1\nexclude_paths = [\"~/alias/cargo\"]\n",
+    )
+    .unwrap();
+    let env = environment(temp.path(), temp.path());
+    let result = search(
+        SearchRequest {
+            search_root: Some(actual),
+        },
+        &env,
+    )
+    .unwrap();
+    assert!(result.candidates.is_empty());
+}
