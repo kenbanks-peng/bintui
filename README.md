@@ -35,6 +35,7 @@ Example ~/.config/bintui/config.toml
 ```toml
 version = 1
 bin_dir = "~/.local/bin"
+exclude_paths = ["~/Software/Toolchain/cargo"]
 ignore = [
   ".git",
   "target/",
@@ -48,6 +49,7 @@ tools = "$HOME/Tools"
 
 - `version` must be `1`.
 - `bin_dir` override where managed links are published, taking precedence over `XDG_BIN_HOME`.
+- `exclude_paths` excludes exact paths and their entire subtrees, regardless of the search root (not glob patterns).
 - `ignore` contains gitignore-style patterns excluded during executable discovery.
 - `roots` as a convenience, assign short display names to absolute directory paths; paths beneath them are shortened, for example, `[work]/project/script`.
 

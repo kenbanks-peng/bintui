@@ -12,6 +12,7 @@ use crate::environment::Environment;
 pub struct Configuration {
     pub bin_dir: PathBuf,
     pub ignore: Vec<String>,
+    pub exclude_paths: Vec<PathBuf>,
     pub roots: BTreeMap<String, PathBuf>,
 }
 
@@ -40,6 +41,8 @@ struct ConfigFile {
     bin_dir: Option<String>,
     #[serde(default)]
     ignore: Vec<String>,
+    #[serde(default)]
+    exclude_paths: Vec<String>,
     #[serde(default)]
     roots: BTreeMap<String, String>,
 }
@@ -107,6 +110,14 @@ pub fn load(environment: &Environment) -> Result<Configuration, ConfigurationErr
             roots.insert(name.clone(), normalize(&root));
         }
     }
+    let mut exclude_paths = Vec::new();
+    if let Some(config) = &parsed {
+        for value in &config.exclude_paths {
+            let excluded = expand_path(value, environment)?;
+            require_absolute("exclude_paths", &excluded)?;
+            exclude_paths.push(normalize(&excluded));
+        }
+    }
     let configured_bin = parsed.as_ref().and_then(|config| config.bin_dir.as_deref());
     let raw_bin = configured_bin
         .map(str::to_owned)
@@ -128,6 +139,7 @@ pub fn load(environment: &Environment) -> Result<Configuration, ConfigurationErr
         bin_dir: normalize(&bin_dir),
         ignore: parsed.map(|config| config.ignore).unwrap_or_default(),
         roots,
+        exclude_paths,
     })
 }
 

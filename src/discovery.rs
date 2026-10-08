@@ -19,6 +19,12 @@ pub fn discover(
     ignored_patterns: &[String],
     ignored_paths: &BTreeSet<PathBuf>,
 ) -> std::io::Result<Discovery> {
+    if ignored_paths.iter().any(|ignored| root.starts_with(ignored)) {
+        return Ok(Discovery {
+            targets: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
     let metadata = fs::metadata(root)?;
     if !metadata.is_dir() {
         return Err(std::io::Error::new(
@@ -81,7 +87,7 @@ fn visit(
             }
         };
         let child = normalize(&entry.path());
-        if ignored_paths.contains(&child) {
+        if ignored_paths.iter().any(|ignored| child.starts_with(ignored)) {
             continue;
         }
         let metadata = match fs::symlink_metadata(&child) {

@@ -437,3 +437,42 @@ fn directory_snapshot(root: &Path) -> Vec<PathBuf> {
     visit(root, &mut paths);
     paths
 }
+
+#[test]
+fn configured_excluded_paths_prune_subtrees_even_when_search_starts_inside_them() {
+    let temp = TempDir::new().unwrap();
+    let excluded = temp.path().join("Software/Toolchain/cargo");
+    file(&excluded.join("nested/hidden"), 0o755);
+    let kept = temp.path().join("Software/Toolchain/cargo-other/visible");
+    file(&kept, 0o755);
+    let config = temp.path().join(".config/bintui/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "version = 1\nexclude_paths = [\"~/Software/Toolchain/./cargo\"]\n",
+    )
+    .unwrap();
+    let env = environment(temp.path(), temp.path());
+
+    let result = search(
+        SearchRequest {
+            search_root: Some(temp.path().join("Software")),
+        },
+        &env,
+    )
+    .unwrap();
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].target, kept);
+
+    for root in [excluded.clone(), excluded.join("nested")] {
+        let result = search(
+            SearchRequest {
+                search_root: Some(root),
+            },
+            &env,
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+}

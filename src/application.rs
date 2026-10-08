@@ -1195,7 +1195,8 @@ pub fn search(
         normalize(&environment.cwd().join(root))
     };
     let registrations = registry::load(environment)?;
-    let ignored_paths = discovery_ignore::load(environment)?;
+    let mut ignored_paths = discovery_ignore::load(environment)?;
+    ignored_paths.extend(configuration.exclude_paths.iter().cloned());
     let found = if root == configuration.bin_dir {
         discovery::Discovery {
             targets: Vec::new(),
