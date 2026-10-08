@@ -22,6 +22,8 @@ Then launch the TUI:
 bin
 ```
 
+Press `q` to quit, or `Ctrl+C` from any input field or dialog. Quit does not wait for an executable discovery scan. Active file changes and queued Git synchronization finish before exit.
+
 Run `bin --help` to see the non-interactive commands for searching, adding, listing, enabling, disabling, renaming, and removing registrations.
 
 ## Configuration

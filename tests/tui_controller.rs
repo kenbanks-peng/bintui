@@ -99,6 +99,16 @@ fn starts_with_automatic_discovery_at_explicit_root() {
 }
 
 #[test]
+fn exit_works_while_scanning_and_filtering() {
+    let mut controller = Controller::new(PathBuf::from("/Software"));
+    controller.take_request();
+    controller.handle(Event::StartFilter);
+    assert!(controller.semantic_state(80, 24).scanning);
+    controller.handle(Event::Exit);
+    assert!(controller.should_exit());
+}
+
+#[test]
 fn scanning_indicator_tracks_pending_active_completed_and_failed_searches() {
     let mut controller = Controller::new(PathBuf::from("/Software"));
     assert!(controller.semantic_state(80, 24).scanning);

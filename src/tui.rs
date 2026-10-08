@@ -565,6 +565,10 @@ impl Controller {
     }
 
     pub fn handle(&mut self, event: Event) {
+        if event == Event::Exit {
+            self.exit = true;
+            return;
+        }
         if let Event::Resize(width, height) = event {
             self.size = (width, height);
             self.mouse_regions = MouseRegions::default();
@@ -1114,11 +1118,20 @@ fn start_pending_request(
     if !runner.is_active() {
         if let Some(request) = controller.take_request() {
             let environment = environment.clone();
-            let git_sync = git_sync.clone();
+            let git_sync = request_sync_policy(&request, git_sync);
             runner.start(move || execute_request(request, &environment, &git_sync))?;
         }
     }
     Ok(())
+}
+
+fn request_sync_policy(request: &Request, git_sync: &ConfigGitSync) -> ConfigGitSync {
+    if request.is_mutation() {
+        git_sync.clone()
+    } else {
+        // Reads must not keep the Git job queue open while exit drains it.
+        ConfigGitSync::blocking()
+    }
 }
 
 struct BackgroundRunner<T> {
@@ -1176,7 +1189,7 @@ impl<T: Send + 'static> BackgroundRunner<T> {
 
 #[cfg(test)]
 mod background_runner_tests {
-    use super::{start_pending_request, BackgroundRunner, Controller, Event, OperationResult, View};
+    use super::{request_sync_policy, start_pending_request, BackgroundRunner, Controller, Event, OperationResult, Request, View};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -1248,6 +1261,34 @@ mod background_runner_tests {
         assert_eq!(state.view, View::Registrations);
         assert_eq!(state.items.len(), 1);
         assert_eq!(state.items[0].name, "tool");
+    }
+
+    #[test]
+    fn quitting_does_not_wait_for_a_scans_git_queue_sender() {
+        use crate::config_git::BackgroundGitSync;
+
+        let sync = BackgroundGitSync::start();
+        let policy = request_sync_policy(
+            &Request::Search("/Software".into()),
+            &sync.policy(),
+        );
+        let (release_sender, release_receiver) = mpsc::channel();
+        let scan = thread::spawn(move || {
+            release_receiver.recv().unwrap();
+            drop(policy);
+        });
+        let (done_sender, done_receiver) = mpsc::channel();
+        let exit = thread::spawn(move || {
+            let results = sync.finish();
+            done_sender.send(results).unwrap();
+        });
+        let finished = done_receiver.recv_timeout(Duration::from_secs(1));
+        // Always release the scan, even if the regression returns.
+        release_sender.send(()).unwrap();
+        scan.join().unwrap();
+        exit.join().unwrap();
+        assert!(finished.is_ok(), "quit waited for the scan to release the Git queue");
+        assert!(finished.unwrap().is_empty());
     }
 
     #[test]
@@ -1360,6 +1401,13 @@ fn translate_event(event: event::Event, dialog_open: bool, filter_active: bool) 
     match event {
         event::Event::Resize(w, h) => Some(Event::Resize(w, h)),
         event::Event::Mouse(mouse) => Some(Event::Mouse(mouse)),
+        event::Event::Key(key)
+            if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Char('c')
+                && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+        {
+            Some(Event::Exit)
+        }
         event::Event::Key(key)
             if key.kind == KeyEventKind::Press && (dialog_open || filter_active) =>
         {
@@ -1909,6 +1957,21 @@ mod tests {
             .draw(|frame| render(frame, &mut controller))
             .unwrap();
         mouse(&mut controller, MouseEventKind::ScrollDown, 0, 0);
+    }
+
+    #[test]
+    fn control_c_quits_in_every_input_mode() {
+        for (dialog_open, filter_active) in [(false, false), (true, false), (false, true)] {
+            let key = event::Event::Key(event::KeyEvent::new(
+                KeyCode::Char('c'),
+                event::KeyModifiers::CONTROL,
+            ));
+            assert_eq!(translate_event(key, dialog_open, filter_active), Some(Event::Exit));
+        }
+        let mut controller = Controller::new("/Software".into());
+        controller.dialog = Some(Dialog::Error { text: "scan warning".to_owned() });
+        controller.handle(Event::Exit);
+        assert!(controller.should_exit());
     }
 
     #[test]
