@@ -212,7 +212,7 @@ fn newly_registered_candidate_stays_visible_for_the_session() {
 }
 
 #[test]
-fn delete_filter_reload_keeps_the_remaining_discovery_order() {
+fn delete_without_rescan_keeps_the_remaining_discovery_order() {
     let initial = search_result("/project", &["alpha", "beta", "zulu"]);
     let mut controller = Controller::new(PathBuf::from("/project"));
     controller.take_request();
@@ -225,11 +225,8 @@ fn delete_filter_reload_keeps_the_remaining_discovery_order() {
         Some(Request::Ignore(PathBuf::from("/project/beta")))
     );
     controller.complete(OperationResult::Ignore(Ok("target-ignored".to_owned())));
-    controller.take_request();
-    controller.complete(OperationResult::Search(Ok(search_result(
-        "/project",
-        &["alpha", "zulu"],
-    ))));
+    assert_eq!(controller.take_request(), None);
+    assert!(!controller.semantic_state(80, 24).scanning);
 
     let targets: Vec<_> = controller
         .semantic_state(80, 24)
@@ -247,7 +244,7 @@ fn delete_filter_reload_keeps_the_remaining_discovery_order() {
 }
 
 #[test]
-fn delete_ignores_the_focused_discovery_target_and_reloads_the_list() {
+fn delete_ignores_the_focused_discovery_target_without_rescanning() {
     let mut controller = Controller::new(PathBuf::from("/project"));
     controller.take_request();
     controller.complete(OperationResult::Search(Ok(search_result(
@@ -264,14 +261,47 @@ fn delete_ignores_the_focused_discovery_target_and_reloads_the_list() {
     );
     assert!(controller.has_emitted_mutation());
     controller.complete(OperationResult::Ignore(Ok("target-ignored".to_owned())));
-    assert_eq!(
-        controller.take_request(),
-        Some(Request::Search(PathBuf::from("/project")))
-    );
+    assert_eq!(controller.take_request(), None);
+    let state = controller.semantic_state(80, 24);
+    assert!(!state.scanning);
+    assert_eq!(state.items.len(), 1);
+    assert_eq!(state.items[0].name, "alpha");
+    assert_eq!(state.focused, 0);
     assert_eq!(
         controller.semantic_state(80, 24).notice.as_deref(),
         Some("target-ignored")
     );
+}
+
+#[test]
+fn failed_ignore_keeps_the_item_without_rescanning() {
+    let mut controller = Controller::new(PathBuf::from("/project"));
+    controller.take_request();
+    controller.complete(OperationResult::Search(Ok(search_result("/project", &["alpha"]))));
+    controller.handle(Event::Delete);
+    controller.take_request();
+    controller.complete(OperationResult::Ignore(Err(
+        bintui::tui::OperationError::new("ignore-failed", "permission denied"),
+    )));
+    assert_eq!(controller.take_request(), None);
+    let state = controller.semantic_state(80, 24);
+    assert_eq!(state.items.len(), 1);
+    assert!(state.items[0].error.as_deref().unwrap().contains("permission denied"));
+    assert!(!state.scanning);
+}
+
+#[test]
+fn ignored_item_does_not_return_from_an_older_search_snapshot() {
+    let mut controller = Controller::new(PathBuf::from("/project"));
+    let snapshot = search_result("/project", &["alpha"]);
+    controller.take_request();
+    controller.complete(OperationResult::Search(Ok(snapshot.clone())));
+    controller.handle(Event::Delete);
+    controller.take_request();
+    controller.complete(OperationResult::Ignore(Ok("target-ignored".to_owned())));
+    controller.complete(OperationResult::Search(Ok(snapshot)));
+    assert!(controller.semantic_state(80, 24).items.is_empty());
+    assert_eq!(controller.take_request(), None);
 }
 
 #[test]

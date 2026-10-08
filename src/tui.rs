@@ -294,6 +294,8 @@ pub struct Controller {
     pending_add: Option<(PathBuf, String)>,
     active_add_target: Option<PathBuf>,
     session_registered_targets: BTreeSet<PathBuf>,
+    session_ignored_targets: BTreeSet<PathBuf>,
+    active_ignore_target: Option<PathBuf>,
     active_item_key: Option<String>,
     emitted_mutation: bool,
     exit: bool,
@@ -336,6 +338,8 @@ impl Controller {
             pending_add: None,
             active_add_target: None,
             session_registered_targets: BTreeSet::new(),
+            session_ignored_targets: BTreeSet::new(),
+            active_ignore_target: None,
             active_item_key: None,
             emitted_mutation: false,
             exit: false,
@@ -390,8 +394,9 @@ impl Controller {
                     .map(|(index, entry)| (entry.target.clone(), index))
                     .collect();
                 result.candidates.retain(|candidate| {
-                    candidate.registration.is_none()
-                        || self.session_registered_targets.contains(&candidate.target)
+                    !self.session_ignored_targets.contains(&candidate.target)
+                        && (candidate.registration.is_none()
+                            || self.session_registered_targets.contains(&candidate.target))
                 });
                 result.candidates.sort_by(|left, right| {
                     match (
@@ -498,13 +503,35 @@ impl Controller {
                 self.pending = Some(Request::Search(self.search_root.clone()));
             }
             OperationResult::Mutation(result) => {
-                self.finish_mutation(result.map(|result| result.identifier));
+                self.finish_mutation(result.map(|result| result.identifier), true);
             }
-            OperationResult::Ignore(result) => self.finish_mutation(result),
+            OperationResult::Ignore(result) => {
+                if result.is_ok() {
+                    if let Some(target) = self.active_ignore_target.take() {
+                        self.session_ignored_targets.insert(target.clone());
+                        self.discover.entries.retain(|entry| entry.target != target);
+                        let targets: Vec<_> = self.discover.entries.iter()
+                            .map(|entry| entry.target.clone()).collect();
+                        for entry in &mut self.discover.entries {
+                            if entry.conflict == Some(ConflictKind::DuplicateProposedName)
+                                && !targets.iter().any(|other| {
+                                    other != &entry.target
+                                        && other.file_name() == entry.target.file_name()
+                                })
+                            {
+                                entry.conflict = None;
+                            }
+                        }
+                        self.discover.clamp_focus(&self.filter);
+                    }
+                }
+                self.active_ignore_target = None;
+                self.finish_mutation(result, false);
+            }
         }
     }
 
-    fn finish_mutation(&mut self, result: Result<String, OperationError>) {
+    fn finish_mutation(&mut self, result: Result<String, OperationError>, reload: bool) {
         self.mutation_active = false;
         match result {
             Ok(identifier) => {
@@ -532,7 +559,9 @@ impl Controller {
         }
         self.active_item_key = None;
         self.preserve_registration_order = self.view == View::Registrations;
-        self.pending = Some(self.reload_request());
+        if reload {
+            self.pending = Some(self.reload_request());
+        }
     }
 
     pub fn handle(&mut self, event: Event) {
@@ -824,6 +853,10 @@ impl Controller {
     fn begin_mutation(&mut self, request: Request) {
         debug_assert!(request.is_mutation());
         self.mutation_active = true;
+        self.active_ignore_target = match &request {
+            Request::Ignore(target) => Some(target.clone()),
+            _ => None,
+        };
         self.active_item_key = match &request {
             Request::Add { target, .. } | Request::ValidateAdd { target, .. } => {
                 Some(target.display().to_string())
